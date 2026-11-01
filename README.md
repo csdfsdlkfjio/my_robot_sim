@@ -225,7 +225,7 @@ ros2 topic echo /cmd_vel              # 避障节点最终发出的速度指令
 
 ## 核心排错记录
 
-以下是本项目从"能启动"到"能稳定走正方形、能避障、能建图、能导航"过程中实际遇到并修复的七个问题，按时间顺序记录。
+以下是本项目从"能启动"到"能稳定走正方形、能避障、能建图、能导航"过程中实际遇到并修复的八个问题，按时间顺序记录。
 
 ### 1. `/odom` 和 `odom → base_link` TF 不发布
 
@@ -556,6 +556,54 @@ ros2 topic echo /scan --once    # 360 个 ranges，有效回波 0 个
 | 演示世界 SLAM 结果 | 全 `unknown`（空白图） | **occupied 396 / free 11690** |
 
 > 判断一张已保存的地图是否为空：PGM 里所有像素都是 205（灰度 205 = unknown）。只要出现 0（occupied）或 254（free），就说明建图时确实采到了障碍物。
+
+### 8. RViz 的 RobotModel 报 `No transform from [left_wheel]`
+
+**现象**
+
+RViz 里机器人只显示底盘和雷达，左右轮消失，RobotModel 对它们报 `No transform from [left_wheel]` / `[right_wheel]`；`base_link`、`lidar_link` 却一切正常。
+
+**排查**
+
+```bash
+ros2 topic info /joint_states      # Publisher count: 0
+ros2 topic echo /tf_static --once  # 只有 caster_link、lidar_link
+```
+
+TF 树里固定关节（`caster_joint`、`lidar_joint`）由 `robot_state_publisher` 直接发布；但两个轮子是 `continuous` 关节，`robot_state_publisher` 必须先收到 `/joint_states` 才知道它们的角度，才会广播 `base_link → left_wheel`。
+
+**原因**
+
+`gazebo_ros_diff_drive` 只负责驱动轮子、发布 `/odom`，**不会发布 `/joint_states`**。URDF 里只配置了差速驱动和雷达两个插件，因此队列里没有任何关节状态，轮子永远没有 TF。
+
+**解决**
+
+在 `urdf/my_car.urdf` 末尾追加 Gazebo 关节状态发布插件：
+
+```xml
+<gazebo>
+  <plugin name="joint_state_publisher"
+          filename="libgazebo_ros_joint_state_publisher.so">
+    <ros>
+      <remapping>~/out:=joint_states</remapping>
+    </ros>
+    <update_rate>30</update_rate>
+    <joint_name>left_wheel_joint</joint_name>
+    <joint_name>right_wheel_joint</joint_name>
+  </plugin>
+</gazebo>
+```
+
+**验证**
+
+| 检查 | 修复前 | 修复后 |
+| --- | --- | --- |
+| `/joint_states` 发布者 | 0 | **1** |
+| `base_link → left_wheel` TF | 不存在 | **(0.1, 0.15, -0.1)** |
+| `base_link → right_wheel` TF | 不存在 | **(0.1, -0.15, -0.1)** |
+| 以 0.2 m/s 直行时轮速 | — | **2.0 rad/s**（轮半径 0.1 m） |
+
+> 修改 URDF 后必须**重启 Gazebo 并重新 spawn 模型**——已经在运行的 gzserver 里加载的是旧插件，只重启 RViz 是没用的。
 
 ---
 
