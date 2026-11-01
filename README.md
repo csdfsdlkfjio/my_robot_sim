@@ -65,9 +65,14 @@
 my_robot_sim/
 ├── launch/
 │   ├── sim.launch.py        # 启动 Gazebo + robot_state_publisher + 生成小车
-│   └── slam.launch.py       # slam_toolbox + 带配置的 RViz
+│   ├── slam.launch.py       # slam_toolbox + 带配置的 RViz
+│   └── nav2.launch.py       # Nav2 导航（map_server + AMCL + 规划/控制）
 ├── rviz/
 │   └── slam.rviz            # LaserScan + Map + TF 显示配置
+├── maps/
+│   └── my_map.yaml/.pgm     # SLAM 保存的地图
+├── worlds/
+│   └── demo.world           # 8×8 m 演示房间（四面墙 + 两个障碍物）
 ├── urdf/
 │   └── my_car.urdf          # 小车模型与 gazebo_ros_diff_drive 插件配置
 ├── my_robot_sim/
@@ -173,6 +178,37 @@ ros2 launch my_robot_sim slam.launch.py
 
 > 先关掉手动打开的 RViz 再运行，避免两个窗口同时订阅。手动建图时让小车慢慢走一圈即可，`slam_toolbox` 会用 `/scan` 和 `odom → base_link` 生成地图。
 
+### 用演示世界建图（重要）
+
+`sim.launch.py` 默认加载 Gazebo 的**空世界**，里面没有任何障碍物，雷达 360 个点全是 `inf`，SLAM 只会存出一张全 `unknown` 的空白地图。建图请指定 `worlds/demo.world`：
+
+```bash
+source ~/ros2_ws/install/setup.bash
+DEMO=$(ros2 pkg prefix my_robot_sim)/share/my_robot_sim/worlds/demo.world
+ros2 launch my_robot_sim sim.launch.py world:=$DEMO
+```
+
+演示世界是一个 8×8 m 的封闭房间，四面有墙、房内有两个箱子；雷达从中心就能看到 4 m 外的墙。
+
+建完图保存（存到源码目录，`--symlink-install` 会让 `share/` 里的文件同步更新，无需重新编译）：
+
+```bash
+ros2 run nav2_map_server map_saver_cli -f ~/ros2_ws/src/my_robot_sim/maps/my_map
+```
+
+### Nav2 导航
+
+先停掉 `slam.launch.py`（建图和导航不要同时跑），再：
+
+```bash
+source ~/ros2_ws/install/setup.bash
+ros2 launch my_robot_sim nav2.launch.py
+# 也可以指定别的地图：
+# ros2 launch my_robot_sim nav2.launch.py map:=/绝对路径/xxx.yaml
+```
+
+RViz 打开后先用工具栏的 **2D Pose Estimate** 给出初始位姿（地图上点一下并拖出朝向），AMCL 才会发布 `map → odom`；之后用 **Nav2 Goal** 发送目标点。
+
 ### 查看运行状态
 
 ```bash
@@ -189,7 +225,7 @@ ros2 topic echo /cmd_vel              # 避障节点最终发出的速度指令
 
 ## 核心排错记录
 
-以下是本项目从"能启动"到"能稳定走正方形、能避障、能建图"过程中实际遇到并修复的六个问题，按时间顺序记录。
+以下是本项目从"能启动"到"能稳定走正方形、能避障、能建图、能导航"过程中实际遇到并修复的七个问题，按时间顺序记录。
 
 ### 1. `/odom` 和 `odom → base_link` TF 不发布
 
@@ -446,6 +482,80 @@ ros2 node info /rviz
 ```
 
 能看到订阅 `/scan: sensor_msgs/msg/LaserScan` 与 `/map`，RViz 中显示红色的激光扫描点。
+
+---
+
+### 7. Nav2 启动后 RViz 全黑，Global Status 报 Error
+
+**现象**
+
+`ros2 launch my_robot_sim nav2.launch.py` 后 RViz 一片漆黑，无论怎么缩放移动都看不到地图，Global Status 显示 Error。地图文件就放在包目录下：
+
+```
+~/ros2_ws/src/my_robot_sim/my_map.yaml
+~/ros2_ws/src/my_robot_sim/my_map.pgm
+```
+
+**排查**
+
+```bash
+ros2 lifecycle get /map_server   # unconfigured（正常应为 active）
+ros2 lifecycle get /amcl         # unconfigured
+ros2 topic info /map -v          # Publisher count: 0
+```
+
+`map_server` 节点起来了，但连配置都没通过；`/map` 没有任何发布者，AMCL 也就无法激活、不发布 `map → odom`，RViz 既没有地图也没有 TF。
+
+**原因 1：地图文件没有被安装到 `share/`**
+
+`nav2.launch.py` 里写的是：
+
+```python
+map_file = os.path.join(
+    get_package_share_directory('my_robot_sim'), 'my_map.yaml')
+```
+
+`get_package_share_directory()` 返回的是 `install/.../share/my_robot_sim`，而 `setup.py` 只安装了 `urdf/`、`launch/`、`rviz/`——**`my_map.*` 从来没有被装进去**，`map_server` 读 yaml 时文件不存在，configure 失败，lifecycle manager 放弃启动，后面所有节点都停在 `unconfigured`。
+
+**原因 2：这张地图本身是空白的**
+
+即使把路径修好，这张图也没有任何可用信息。直接解 PGM 就能确认：
+
+```
+P5 / 280 45 / 255
+12600 个像素，全部是 205（unknown）
+```
+
+同时检查实时雷达：
+
+```bash
+ros2 topic echo /scan --once    # 360 个 ranges，有效回波 0 个
+```
+
+世界是空的（`empty.world`），雷达看到的所有东西都超出 5 m 量程返回 `inf`，SLAM 没有任何 occupied/free 栅格可写，保存出来的自然是一张全 `unknown` 的图。
+
+**解决**
+
+1. 地图移到 `maps/` 目录，`setup.py` 增加安装规则：
+
+   ```python
+   (os.path.join('share', package_name, 'maps'), glob('maps/*')),
+   (os.path.join('share', package_name, 'worlds'), glob('worlds/*.world')),
+   ```
+
+2. `nav2.launch.py` 改用 `share/maps/my_map.yaml`，并支持 `map:=` 覆盖；重新编译后 `map_server` 可以正常加载。
+3. 新增 `worlds/demo.world`（8×8 m 房间 + 障碍物），`sim.launch.py` 支持 `world:=` 参数，让 SLAM 有东西可画。
+
+**验证**
+
+| 检查 | 修复前 | 修复后 |
+| --- | --- | --- |
+| `map_server` 状态 | `unconfigured` | **`active`** |
+| `/map` 发布者 | 0 | **1** |
+| 地图加载 | 文件不存在 | `280 X 45 map @ 0.05 m/cell` |
+| 演示世界 SLAM 结果 | 全 `unknown`（空白图） | **occupied 396 / free 11690** |
+
+> 判断一张已保存的地图是否为空：PGM 里所有像素都是 205（灰度 205 = unknown）。只要出现 0（occupied）或 254（free），就说明建图时确实采到了障碍物。
 
 ---
 
