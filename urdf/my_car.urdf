@@ -1,0 +1,109 @@
+<?xml version="1.0"?>
+<robot name="my_car">
+  <!-- 1. 车体 -->
+  <link name="base_link">
+    <visual>
+      <geometry><box size="0.4 0.25 0.05"/></geometry>
+      <material name="blue"><color rgba="0.1 0.3 0.9 1.0"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="0.4 0.25 0.05"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.005417" iyy="0.013542" izz="0.018542" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+  <!-- 2. 左轮
+       驱动轮必须放在重心前方（x=+0.1），否则重心几乎压在轮轴线上：
+       万向轮只承担 ~5% 重量，一刹车/转弯车头就栽下去且回不来。 -->
+  <link name="left_wheel">
+    <visual>
+      <origin rpy="1.5708 0 0" xyz="0 0 0"/>
+      <geometry><cylinder radius="0.1" length="0.05"/></geometry>
+      <material name="black"><color rgba="0 0 0 1"/></material>
+    </visual>
+    <collision>
+      <origin rpy="1.5708 0 0" xyz="0 0 0"/>
+      <geometry><cylinder radius="0.1" length="0.05"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.5"/>
+      <inertia ixx="0.001354" iyy="0.0025" izz="0.001354" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="left_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="left_wheel"/>
+    <origin xyz="0.1 0.15 -0.1"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- 3. 右轮 -->
+  <link name="right_wheel">
+    <visual>
+      <origin rpy="1.5708 0 0" xyz="0 0 0"/>
+      <geometry><cylinder radius="0.1" length="0.05"/></geometry>
+      <material name="black"><color rgba="0 0 0 1"/></material>
+    </visual>
+    <collision>
+      <origin rpy="1.5708 0 0" xyz="0 0 0"/>
+      <geometry><cylinder radius="0.1" length="0.05"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.5"/>
+      <inertia ixx="0.001354" iyy="0.0025" izz="0.001354" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="right_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="right_wheel"/>
+    <origin xyz="0.1 -0.15 -0.1"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- 4. 万向轮：Z轴改到 -0.15，保证它跟轮子一样平，不会翘头 -->
+  <link name="caster_link">
+    <visual>
+      <geometry><sphere radius="0.05"/></geometry>
+      <material name="gray"><color rgba="0.5 0.5 0.5 1"/></material>
+    </visual>
+    <collision>
+      <geometry><sphere radius="0.05"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.0001" iyy="0.0001" izz="0.0001" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="caster_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="caster_link"/>
+    <origin xyz="-0.18 0 -0.15"/>
+  </joint>
+
+  <!-- 摩擦力与驱动 -->
+  <gazebo reference="left_wheel"><mu1>10.0</mu1><mu2>10.0</mu2></gazebo>
+  <gazebo reference="right_wheel"><mu1>10.0</mu1><mu2>10.0</mu2></gazebo>
+  <gazebo reference="caster_link"><mu1>0.0</mu1><mu2>0.0</mu2></gazebo>
+
+  <gazebo>
+    <plugin name="diff_drive" filename="libgazebo_ros_diff_drive.so">
+      <!-- 这里已经改成了 10，跟物理时钟对齐！ -->
+      <update_rate>10</update_rate>
+      <left_joint>left_wheel_joint</left_joint>
+      <right_joint>right_wheel_joint</right_joint>
+      <wheel_separation>0.3</wheel_separation>
+      <wheel_diameter>0.2</wheel_diameter>
+      <max_wheel_torque>50</max_wheel_torque>
+      <max_wheel_acceleration>1.0</max_wheel_acceleration>
+      <!-- ROS 2 版 gazebo_ros_diff_drive：publish_odom / publish_odom_tf
+           默认都是 false，不显式打开就不会创建 /odom 和 odom->base_link 的 TF -->
+      <publish_odom>true</publish_odom>
+      <publish_odom_tf>true</publish_odom_tf>
+      <odometry_frame>odom</odometry_frame>
+      <robot_base_frame>base_link</robot_base_frame>
+    </plugin>
+  </gazebo>
+</robot>
