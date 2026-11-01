@@ -6,6 +6,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 import xacro
 
+
 def generate_launch_description():
     pkg_path = get_package_share_directory('my_robot_sim')
     xacro_file = os.path.join(pkg_path, 'urdf', 'my_car.urdf')
