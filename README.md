@@ -64,7 +64,10 @@
 ```
 my_robot_sim/
 ├── launch/
-│   └── sim.launch.py        # 启动 Gazebo + robot_state_publisher + 生成小车
+│   ├── sim.launch.py        # 启动 Gazebo + robot_state_publisher + 生成小车
+│   └── slam.launch.py       # slam_toolbox + 带配置的 RViz
+├── rviz/
+│   └── slam.rviz            # LaserScan + Map + TF 显示配置
 ├── urdf/
 │   └── my_car.urdf          # 小车模型与 gazebo_ros_diff_drive 插件配置
 ├── my_robot_sim/
@@ -159,6 +162,17 @@ python3 ~/ros2_ws/src/my_robot_sim/my_robot_sim/avoid_obstacle.py
 | `TURN_SPEED` | 1.0 rad/s | 原地左转角速度 |
 | `SCAN_TIMEOUT` | 1.0 s | 超过该时间没收到 `/scan` 就发零速度停车 |
 
+终端 3 —— SLAM 建图 + RViz 可视化：
+
+```bash
+source ~/ros2_ws/install/setup.bash
+ros2 launch my_robot_sim slam.launch.py
+```
+
+`slam.launch.py` 会同时启动 `slam_toolbox` 和 RViz，RViz 使用项目自带的 `rviz/slam.rviz`：Fixed Frame = `map`，LaserScan 已绑定 `/scan`，并显示 `/map` 与 TF。
+
+> 先关掉手动打开的 RViz 再运行，避免两个窗口同时订阅。手动建图时让小车慢慢走一圈即可，`slam_toolbox` 会用 `/scan` 和 `odom → base_link` 生成地图。
+
 ### 查看运行状态
 
 ```bash
@@ -175,7 +189,7 @@ ros2 topic echo /cmd_vel              # 避障节点最终发出的速度指令
 
 ## 核心排错记录
 
-以下是本项目从"能启动"到"能稳定走正方形、能避障"过程中实际遇到并修复的五个问题，按时间顺序记录。
+以下是本项目从"能启动"到"能稳定走正方形、能避障、能建图"过程中实际遇到并修复的六个问题，按时间顺序记录。
 
 ### 1. `/odom` 和 `odom → base_link` TF 不发布
 
@@ -380,6 +394,58 @@ Publisher count: 0
 | 是否接触墙面 | 是，贴墙摩擦直至顶翻 | **否**（车头最远 x≈0.64 m，墙面 0.95 m） |
 | 行驶姿态 | 贴墙时 roll 涨到 0.04 rad | **pitch / roll ≈ 1e-6 rad** |
 | `base_link` 高度 | 0.204 m（被顶起） | **0.200 m** |
+
+---
+
+### 6. RViz 里选不到 `/scan`，提示 `Error subscribing: Empty topic name`
+
+**现象**
+
+RViz 中添加 LaserScan 显示后，Topic 下拉框为空或选不到 `/scan`，显示项状态栏报：
+
+```
+Error subscribing: Empty topic name
+```
+
+**排查**
+
+```bash
+ros2 topic list -t | grep scan      # /scan [sensor_msgs/msg/LaserScan]
+ros2 topic info /scan -v            # Publisher count: 1（gazebo_ros_laser）
+ros2 topic hz /scan                 # 约 10 Hz
+ros2 topic echo /scan --once        # frame_id: lidar_link，ranges 有数据
+ros2 run tf2_ros tf2_echo base_link lidar_link
+```
+
+排查结果：**话题存在、有数据、TF 也正常**，雷达和插件都没有问题——故障在 RViz 配置侧。
+
+**原因**
+
+- `Error subscribing: Empty topic name` 是显示项 **Topic 为空** 时的状态提示，不是"订阅失败"；RViz 只有选中话题后才会真正创建订阅；
+- 手动添加 LaserScan 显示后，Topic 默认是空的，必须自己选；
+- WSL2 软件渲染下 RViz 的话题下拉框可能弹不出来或显示为空；
+- Fixed Frame 必须是 TF 树里真实存在的帧（`map` 或 `odom`），否则即使订阅成功也画不出点。
+
+**解决**
+
+1. 使用项目自带的配置启动，显示项、话题和 Fixed Frame 都已配好：
+
+   ```bash
+   ros2 launch my_robot_sim slam.launch.py
+   ```
+
+2. 手动添加时：在 LaserScan 的 **Topic 输入框里直接键入 `/scan`**（下拉框为空也能手输），Fixed Frame 选 `map`，Reliability 选 `Best Effort`。
+3. 若列表始终为空：确认 `ros2 topic list` 能看到 `/scan` 后重启 RViz，或检查添加的是不是 LaserScan 显示（PointCloud2 显示的列表里不会出现 `LaserScan` 类型的话题）。
+
+**验证**
+
+RViz 启动后：
+
+```bash
+ros2 node info /rviz
+```
+
+能看到订阅 `/scan: sensor_msgs/msg/LaserScan` 与 `/map`，RViz 中显示红色的激光扫描点。
 
 ---
 
