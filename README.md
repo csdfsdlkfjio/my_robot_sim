@@ -1,6 +1,6 @@
 # my_robot_sim
 
-基于 **ROS 2 Humble + Gazebo Classic 11** 的两轮差速驱动机器人仿真示例：一个 URDF 小车模型、一个差速驱动插件配置，以及一个让小车走正方形的演示节点。
+基于 **ROS 2 Humble + Gazebo Classic 11** 的两轮差速驱动机器人仿真示例：一个带 2D 激光雷达的 URDF 小车模型、差速驱动与射线雷达插件配置，以及走正方形和激光避障两个演示节点。
 
 本项目刻意保持"最小但完整"，适合作为学习 URDF 建模、`gazebo_ros_diff_drive` 配置和差速底盘参数调试的起点。
 
@@ -23,10 +23,12 @@
 | `left_wheel` | cylinder `r=0.1 m, l=0.05 m` | 0.5 kg | `(0.10, +0.15, -0.10)` |
 | `right_wheel` | cylinder `r=0.1 m, l=0.05 m` | 0.5 kg | `(0.10, -0.15, -0.10)` |
 | `caster_link` | sphere `r=0.05 m` | 0.1 kg | `(-0.18, 0, -0.15)` |
+| `lidar_link` | cylinder `r=0.05 m, l=0.05 m` | 0.1 kg | `(0.10, 0, +0.05)` |
 
 - 三个着地点同在 `z = -0.20`，静止时 `base_link` 离地 **0.20 m**。
 - 驱动轮绕 `y` 轴旋转（`axis xyz="0 1 0"`），轮距 0.30 m，轮径 0.20 m。
 - 万向轮为 `fixed` 关节，球体 `mu1 = mu2 = 0`，可在地面上自由滑动。
+- 雷达装在车头 `x = +0.10`、底盘顶面之上，扫描平面离地 **0.25 m**（`base_link` 0.20 m + 雷达 0.05 m），不会扫到自身车体。
 
 ### 差速驱动插件参数
 
@@ -41,6 +43,20 @@
 | `odometry_frame` | `odom` | 里程计坐标系 |
 | `robot_base_frame` | `base_link` | 机器人基座坐标系 |
 
+### 激光雷达参数
+
+| 参数 | 值 | 说明 |
+| --- | --- | --- |
+| `sensor type` | `ray` | CPU 射线雷达，无需 GPU |
+| `update_rate` | 10 Hz | 与差速插件同频 |
+| `samples` | 360 | 每圈 360 个点，分辨率 1° |
+| `min_angle` / `max_angle` | `-3.14` / `3.14` | 360° 全向扫描 |
+| `range min` / `max` | 0.1 / 5.0 m | **超出范围的点返回 `inf`** |
+| `noise stddev` | 0.01 m | 高斯噪声 |
+| 输出话题 | `/scan`（`sensor_msgs/LaserScan`） | 由 `libgazebo_ros_ray_sensor.so` 发布，`frame_id = lidar_link` |
+
+> **索引约定**：`angle_min = -π`，所以 `ranges[0]` 是**正后方**，正前方在索引 `len/2` 附近。按索引 0 找障碍物的代码一定会失效，必须按 `angle_min + i · angle_increment` 换算。
+
 ---
 
 ## 目录结构
@@ -53,9 +69,10 @@ my_robot_sim/
 │   └── my_car.urdf          # 小车模型与 gazebo_ros_diff_drive 插件配置
 ├── my_robot_sim/
 │   ├── __init__.py
-│   └── square_mover.py      # 发布 /cmd_vel，让小车走正方形
+│   ├── square_mover.py      # 发布 /cmd_vel，让小车走正方形
+│   └── avoid_obstacle.py    # 订阅 /scan，激光雷达避障
 ├── resource/
-├── test/                    # ament 代码风格测试
+├── test/                    # ament 代码风格测试 + 避障逻辑单元测试
 ├── package.xml
 ├── setup.py
 ├── setup.cfg
@@ -120,6 +137,28 @@ python3 ~/ros2_ws/src/my_robot_sim/my_robot_sim/square_mover.py
 
 > `square_mover` 目前没有在 `setup.py` 中注册为 `console_scripts`，因此用 `python3` 直接运行；若要支持 `ros2 run my_robot_sim square_mover`，在 `setup.py` 的 `entry_points` 中加入对应条目后重新编译即可。
 
+终端 2 —— 激光雷达避障：
+
+```bash
+source ~/ros2_ws/install/setup.bash
+python3 ~/ros2_ws/src/my_robot_sim/my_robot_sim/avoid_obstacle.py
+```
+
+> 避障节点和 `square_mover` 都会向 `/cmd_vel` 发指令，**不要同时运行**，否则两个节点会互相抢控制权。
+
+### 避障节点行为与参数
+
+节点订阅 `/scan`，取正前方 ±30° 扇区内**第 3 小**的有效距离（过滤单点坏值），按带迟滞的规则输出 `/cmd_vel`：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `FRONT_HALF_ANGLE` | 30° | 正前方安全走廊半角 |
+| `OBSTACLE_DISTANCE` | 0.6 m | 小于该距离开始原地转向 |
+| `CLEAR_DISTANCE` | 1.0 m | 转向后必须大于该距离才恢复直行（迟滞） |
+| `FORWARD_SPEED` | 0.3 m/s | 直行速度 |
+| `TURN_SPEED` | 1.0 rad/s | 原地左转角速度 |
+| `SCAN_TIMEOUT` | 1.0 s | 超过该时间没收到 `/scan` 就发零速度停车 |
+
 ### 查看运行状态
 
 ```bash
@@ -127,13 +166,16 @@ ros2 topic echo /odom                 # 里程计
 ros2 topic echo /joint_states         # 轮子关节状态
 ros2 run tf2_tools view_frames        # 检查 odom -> base_link 是否存在
 gz model -m my_car -p                 # 直接读取 Gazebo 中的位姿（x y z roll pitch yaw）
+ros2 topic info /scan                 # 雷达有没有发布者（Publisher count 应为 1）
+ros2 topic hz /scan                   # 雷达频率（应接近 10 Hz）
+ros2 topic echo /cmd_vel              # 避障节点最终发出的速度指令
 ```
 
 ---
 
 ## 核心排错记录
 
-以下是本项目从"能启动"到"能稳定走完正方形"过程中实际遇到并修复的三个问题，按时间顺序记录。
+以下是本项目从"能启动"到"能稳定走正方形、能避障"过程中实际遇到并修复的五个问题，按时间顺序记录。
 
 ### 1. `/odom` 和 `odom → base_link` TF 不发布
 
@@ -260,10 +302,92 @@ x_com = (1.1·(-0.0164) + 1.0·0.10) / 2.1 ≈ +39 mm
 
 ---
 
+### 4. 避障节点启动了，但小车不动
+
+**现象**
+
+避障节点正常打印 `避障节点已启动`，但小车一动不动；`ros2 topic info /scan` 显示：
+
+```
+Publisher count: 0
+```
+
+**原因（四个问题叠加）**
+
+1. **正在运行的 URDF 里没有雷达**：Gazebo 中没有 `ray` 传感器，`/scan` 没有任何发布者。
+2. **指令只写在回调里**：节点只在 `LaserScan` 回调中发布 `/cmd_vel`，没有雷达数据就永远不发布，日志只剩启动那一行。
+3. **URDF 本身是坏的**：`<scan>` 块用 `</ray>` 闭合，XML 解析直接失败；同时 `lidar_link` / `lidar_joint` 重复定义。
+4. **索引假设错误**：代码用 `ranges[0]` 当正前方。实际 `angle_min = -π`，索引 0 是**正后方**，正前方在 `len/2` 附近。（即使雷达正常，这套判断也会朝错误方向避障。）
+
+**解决**
+
+- URDF：修正标签闭合、删除重复定义，雷达固定在 `(0.10, 0, 0.05)`，扫描平面离地 0.25 m（高于底盘顶面，不会扫到自身）；
+- 插件：`~/out:=scan` 重映射，`output_type = sensor_msgs/LaserScan`；
+- 节点：按 `angle_min + i · angle_increment` 计算每个点的真实角度来筛选前方扇区，不再依赖索引；
+- 增加看门狗：超过 1 s 没有 `/scan` 就发布零速度，避免失控。
+
+**验证**
+
+在独立 Gazebo 实例中（前方 1.0 m 处放一堵墙）实测：
+
+| 检查项 | 结果 |
+| --- | --- |
+| `/scan` 发布者 | `Publisher count: 1`，`frame_id = lidar_link`，360 点 |
+| `/scan` 频率 | 约 10 Hz（受实时因子影响） |
+| `/cmd_vel` 是否发布 | 10 Hz，先直行后转向 |
+| 小车是否移动 | 20 s 内位移超过 1.4 m |
+| 行驶姿态 | `pitch / roll ≈ 1e-6 rad`，`z = 0.200 m` |
+
+---
+
+### 5. 避障时贴着墙一路蹭，最后把车顶翻
+
+**现象**
+
+第一版避障确实会转向，但转向后车仍旧朝墙逼近，反复"转一点 → 以为安全 → 再前进"，日志像这样跳变：
+
+```
+危险！前方障碍物 0.59 m，紧急左转
+危险！前方障碍物 0.10 m，紧急左转   ← 单帧坏值
+危险！前方障碍物 0.53 m，紧急左转
+前方安全，最近距离 0.63 m，继续前进   ← 刚转一点就判定安全
+```
+
+长时间运行后车贴在墙上摩擦，最终被顶翻（`roll = π`）。
+
+**原因**
+
+1. **扇区太窄**：只看 ±10°，车头转 10° 墙就滑出扇区，读数瞬间变大；
+2. **没有迟滞**：读数一旦超过 0.6 m 就恢复直行，而车身仍然斜着朝墙逼近；
+3. **被单点坏值带偏**：取 `min()`，Gazebo 射线雷达偶发的 `range_min` 级坏值（0.10 m）一帧就能触发转向；
+4. **`inf` 的歧义**：障碍物近于 `range_min`（0.1 m）时雷达返回 `inf`，节点把它当"前方空旷"，于是继续顶墙。
+
+**解决**
+
+| 修改 | 作用 |
+| --- | --- |
+| 扇区加宽到 **±30°** | 覆盖车身宽度，转向后不会立刻"看不到"障碍物 |
+| 迟滞：转向后必须 **> 1.0 m** 才恢复直行 | 不会转一点点就继续前进 |
+| 取扇区内**第 3 小**距离 | 过滤单点坏值，真障碍物占满扇区不受影响 |
+
+**验证**
+
+同一堵墙、同一初始位置重跑 20 s：
+
+| 指标 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 转向次数 | 反复来回（117 帧转向 / 80 帧前进） | **1 次**（1.8 s，约 104°） |
+| 是否接触墙面 | 是，贴墙摩擦直至顶翻 | **否**（车头最远 x≈0.64 m，墙面 0.95 m） |
+| 行驶姿态 | 贴墙时 roll 涨到 0.04 rad | **pitch / roll ≈ 1e-6 rad** |
+| `base_link` 高度 | 0.204 m（被顶起） | **0.200 m** |
+
+---
+
 ## 已知限制
 
 - 使用 Gazebo **Classic 11**（`gazebo_ros`），不是 Gazebo Sim（`ros_gz`），迁移到新版本需改写插件标签。
 - `square_mover` 用固定时长开环控制（直行 2 s、转弯 1 s），不读取 `/odom` 做闭环，实际轨迹会随地面摩擦和负载略有偏差。
 - 万向轮为零摩擦球体，转向时靠滑动，不适合高精度路径跟踪场景。
+- 避障采用的是**反应式规则**（前方扇区 + 迟滞），没有建图和路径规划：遇到 U 型障碍、狭窄通道或死角时会在原地反复转向，不会主动"退出来"。
 
 > **WSL2 提示**：在 WSL2 中运行 Gazebo Classic 若出现黑屏/闪退，可尝试 `export LIBGL_ALWAYS_SOFTWARE=1` 使用软件渲染（帧率会明显下降）。
