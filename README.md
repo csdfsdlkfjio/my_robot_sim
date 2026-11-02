@@ -69,6 +69,8 @@ my_robot_sim/
 │   └── nav2.launch.py       # Nav2 导航（map_server + AMCL + 规划/控制）
 ├── rviz/
 │   └── slam.rviz            # LaserScan + Map + TF 显示配置
+├── config/
+│   └── nav2_params.yaml     # Nav2 参数（AMCL 的 base_frame_id 改为 base_link）
 ├── maps/
 │   └── my_map.yaml/.pgm     # SLAM 保存的地图
 ├── worlds/
@@ -209,6 +211,12 @@ ros2 launch my_robot_sim nav2.launch.py
 
 RViz 打开后先用工具栏的 **2D Pose Estimate** 给出初始位姿（地图上点一下并拖出朝向），AMCL 才会发布 `map → odom`；之后用 **Nav2 Goal** 发送目标点。
 
+导航参数来自本包的 `config/nav2_params.yaml`（`nav2_bringup` 默认参数的一份副本，唯一改动是 AMCL 的 `base_frame_id`：本车没有 `base_footprint`，必须用 `base_link`）。需要调参时改这个文件，也可以这样换一份：
+
+```bash
+ros2 launch my_robot_sim nav2.launch.py params_file:=/绝对路径/nav2_params.yaml
+```
+
 ### 查看运行状态
 
 ```bash
@@ -225,7 +233,7 @@ ros2 topic echo /cmd_vel              # 避障节点最终发出的速度指令
 
 ## 核心排错记录
 
-以下是本项目从"能启动"到"能稳定走正方形、能避障、能建图、能导航"过程中实际遇到并修复的八个问题，按时间顺序记录。
+以下是本项目从"能启动"到"能稳定走正方形、能避障、能建图、能导航"过程中实际遇到并修复的九个问题，按时间顺序记录。
 
 ### 1. `/odom` 和 `odom → base_link` TF 不发布
 
@@ -604,6 +612,44 @@ TF 树里固定关节（`caster_joint`、`lidar_joint`）由 `robot_state_publis
 | 以 0.2 m/s 直行时轮速 | — | **2.0 rad/s**（轮半径 0.1 m） |
 
 > 修改 URDF 后必须**重启 Gazebo 并重新 spawn 模型**——已经在运行的 gzserver 里加载的是旧插件，只重启 RViz 是没用的。
+
+### 9. 一打开 RViz 就报 `Global Status: Error`
+
+**现象**
+
+`ros2 launch my_robot_sim nav2.launch.py` 后，RViz 左上角立刻是红色 Error，地图一片黑。终端里能看到：
+
+```
+[amcl]: Couldn't transform from lidar_link to base_footprint ...
+[global_costmap.global_costmap]: Timed out waiting for transform from base_link
+         to map to become available, tf error: Invalid frame ID "map"
+```
+
+**原因**
+
+RViz 的 Fixed Frame 是 `map`，而 `map → odom` 只能由 AMCL 发布。本车 URDF 的根 link 是 `base_link`，**没有 `base_footprint`**；但 Nav2 自带的 `nav2_params.yaml` 里 AMCL 的 `base_frame_id` 默认就是 `base_footprint`。于是 AMCL 的每次激光回调都在 TF 查询处失败，初始位姿也应用不上，`map → odom` 永远不会出现，Fixed Frame `map` 不存在，Global Status 报 Error。
+
+这种情况下点 **2D Pose Estimate** 也没用——AMCL 在激光回调里就已经返回了。
+
+**解决**
+
+把 AMCL 的 base frame 改成本车实际存在的 `base_link`。在 `config/nav2_params.yaml` 中：
+
+```yaml
+amcl:
+  ros__parameters:
+    base_frame_id: "base_link"
+```
+
+`nav2.launch.py` 通过 `params_file:=` 传入这份参数。
+
+**验证**
+
+| 检查 | 修复前 | 修复后 |
+| --- | --- | --- |
+| AMCL 日志 | `Couldn't transform ... base_footprint` 刷屏 | 无该错误 |
+| `map → odom` TF | 不存在 | 给出初始位姿后存在 |
+| RViz Fixed Frame `map` | 不存在，Global Status Error | 正常 |
 
 ---
 
