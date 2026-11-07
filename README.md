@@ -72,7 +72,7 @@ my_robot_sim/
 ├── config/
 │   └── nav2_params.yaml     # Nav2 参数（AMCL 的 base_frame_id 改为 base_link）
 ├── maps/
-│   └── my_map.yaml/.pgm     # SLAM 保存的地图
+│   └── my_map.yaml/.pgm     # 用 demo.world 建好的地图，可直接用于 Nav2
 ├── worlds/
 │   └── demo.world           # 8×8 m 演示房间（四面墙 + 两个障碍物）
 ├── urdf/
@@ -192,11 +192,15 @@ ros2 launch my_robot_sim sim.launch.py world:=$DEMO
 
 演示世界是一个 8×8 m 的封闭房间，四面有墙、房内有两个箱子；雷达从中心就能看到 4 m 外的墙。
 
-建完图保存（存到源码目录，`--symlink-install` 会让 `share/` 里的文件同步更新，无需重新编译）：
+建完图保存到源码目录：
 
 ```bash
 ros2 run nav2_map_server map_saver_cli -f ~/ros2_ws/src/my_robot_sim/maps/my_map
 ```
+
+> `--symlink-install` 只对**编译时已存在**的文件建软链，新保存的 `my_map.*` 不会自动出现在 `install/` 里，需要再执行一次 `colcon build --symlink-install --packages-select my_robot_sim`。
+
+仓库里自带的 `maps/my_map.*` 就是用 `demo.world` 建好的版本（223×267 栅格，occupied 2656 / free 25183），可以直接拿来跑 Nav2；自己重新建图会覆盖它。
 
 ### Nav2 导航
 
@@ -564,6 +568,8 @@ ros2 topic echo /scan --once    # 360 个 ranges，有效回波 0 个
 | 演示世界 SLAM 结果 | 全 `unknown`（空白图） | **occupied 396 / free 11690** |
 
 > 判断一张已保存的地图是否为空：PGM 里所有像素都是 205（灰度 205 = unknown）。只要出现 0（occupied）或 254（free），就说明建图时确实采到了障碍物。
+>
+> 仓库当前自带的 `maps/my_map.*` 已经用 `demo.world` 重新建图，不是这张空白图（223×267，occupied 2656 / free 25183）。
 
 ### 8. RViz 的 RobotModel 报 `No transform from [left_wheel]`
 
