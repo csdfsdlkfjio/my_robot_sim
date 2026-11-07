@@ -12,13 +12,14 @@ import sys
 import time
 
 import rclpy
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, Quaternion
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
     BoundingVolume,
     Constraints,
     JointConstraint,
     MoveItErrorCodes,
+    OrientationConstraint,
     PositionConstraint,
 )
 from rclpy.action import ActionClient
@@ -43,9 +44,14 @@ TARGET_POSITION = (0.5, 0.0, 0.3)
 BASE_FRAME = 'panda_link0'
 END_EFFECTOR_LINK = 'panda_hand'
 
+# panda_hand 的 z 轴就是夹爪的朝向（指向两指之间）。它的默认朝向是 z 轴朝上，
+# 绕 base 的 x 轴转 180° 后 z 轴朝下，夹爪垂直向下，像正常抓取一样俯视目标。
+GRIPPER_ORIENTATION = (1.0, 0.0, 0.0, 0.0)  # (x, y, z, w)
+
 MOVE_ACTION = '/move_action'
 JOINT_TOLERANCE = 0.01  # rad
 POSITION_TOLERANCE = 0.01  # m，目标点允许的半径
+ORIENTATION_TOLERANCE = 0.01  # rad，约 0.6°，保证夹爪真的是竖直朝下
 
 
 def make_joint_constraints(joint_names, positions, tolerance=JOINT_TOLERANCE):
@@ -66,10 +72,9 @@ def make_position_constraint(link_name, position,
                              frame_id=BASE_FRAME,
                              radius=POSITION_TOLERANCE):
     """
-    构造只约束位置、不约束姿态的 PositionConstraint.
+    构造只约束位置的 PositionConstraint.
 
-    constraint_region 用一个半径为 ``radius`` 的小球表示；姿态完全放开，
-    这样最容易规划到目标点。
+    constraint_region 用一个半径为 ``radius`` 的小球表示。
     """
     sphere = SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[radius])
     sphere_pose = Pose()
@@ -83,6 +88,28 @@ def make_position_constraint(link_name, position,
     constraint.link_name = link_name
     constraint.constraint_region = BoundingVolume(
         primitives=[sphere], primitive_poses=[sphere_pose])
+    constraint.weight = 1.0
+    return constraint
+
+
+def make_orientation_constraint(link_name, quaternion=GRIPPER_ORIENTATION,
+                                frame_id=BASE_FRAME,
+                                tolerance=ORIENTATION_TOLERANCE):
+    """
+    构造姿态约束，把夹爪固定在指定朝向上.
+
+    ``quaternion`` 是 (x, y, z, w)，含义是该连杆相对 ``frame_id`` 的朝向。
+    默认的 (1, 0, 0, 0) 让连杆 z 轴朝下，也就是夹爪垂直向下。
+    """
+    constraint = OrientationConstraint()
+    constraint.header.frame_id = frame_id
+    constraint.link_name = link_name
+    constraint.orientation = Quaternion(
+        x=float(quaternion[0]), y=float(quaternion[1]),
+        z=float(quaternion[2]), w=float(quaternion[3]))
+    constraint.absolute_x_axis_tolerance = tolerance
+    constraint.absolute_y_axis_tolerance = tolerance
+    constraint.absolute_z_axis_tolerance = tolerance
     constraint.weight = 1.0
     return constraint
 
@@ -127,11 +154,13 @@ class MoveGroupCommander:
             joint_constraints=make_joint_constraints(ARM_JOINTS, positions))
         return self._move(constraints)
 
-    def go_to_position(self, position):
-        """规划并执行到目标位置，姿态不限制."""
+    def go_to_position(self, position, orientation=GRIPPER_ORIENTATION):
+        """规划并执行到目标位置，并强制夹爪竖直朝下."""
         constraints = Constraints(
             position_constraints=[
-                make_position_constraint(END_EFFECTOR_LINK, position)])
+                make_position_constraint(END_EFFECTOR_LINK, position)],
+            orientation_constraints=[
+                make_orientation_constraint(END_EFFECTOR_LINK, orientation)])
         return self._move(constraints)
 
     def _move(self, constraints):
