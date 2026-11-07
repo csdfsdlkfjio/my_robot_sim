@@ -1,5 +1,5 @@
 """
-用 move_group 控制 Panda 机械臂：先回 Home 姿态，再到目标点.
+用 move_group 控制 Panda 机械臂完成一次抓取：回 Home、到目标、闭合夹爪、抬起.
 
 注意：ROS 2 Humble **没有** moveit_commander 包（moveit_commander 是 ROS 1 的
 API，MoveIt 2 官方仓库和 apt 源里都没有）。这里用 rclpy 直接调用 move_group
@@ -47,6 +47,14 @@ END_EFFECTOR_LINK = 'panda_hand'
 # panda_hand 的 z 轴就是夹爪的朝向（指向两指之间）。它的默认朝向是 z 轴朝上，
 # 绕 base 的 x 轴转 180° 后 z 轴朝下，夹爪垂直向下，像正常抓取一样俯视目标。
 GRIPPER_ORIENTATION = (1.0, 0.0, 0.0, 0.0)  # (x, y, z, w)
+
+# SRDF 里夹爪的规划组叫 "hand"（panda_hand 是连杆名，panda_hand_controller
+# 是控制器名）。move_group 已把该组映射到 GripperCommand 控制器。
+GRIPPER_GROUP = 'hand'
+GRIPPER_JOINT = 'panda_finger_joint1'
+GRIPPER_OPEN = 0.04  # m，手指行程上限
+GRIPPER_CLOSED = 0.0
+LIFT_HEIGHT = 0.1  # m，抓取后抬起的高度
 
 MOVE_ACTION = '/move_action'
 JOINT_TOLERANCE = 0.01  # rad
@@ -114,6 +122,11 @@ def make_orientation_constraint(link_name, quaternion=GRIPPER_ORIENTATION,
     return constraint
 
 
+def lift_position(position, height=LIFT_HEIGHT):
+    """返回在 ``position`` 基础上垂直抬高 ``height`` 的位置."""
+    return (position[0], position[1], position[2] + height)
+
+
 class RobotCommander:
     """最小版 RobotCommander：读取当前关节角（替代 moveit_commander 的类）."""
 
@@ -148,11 +161,15 @@ class MoveGroupCommander:
         """等待 move_group 的 /move_action 可用."""
         return self._client.wait_for_server(timeout_sec=timeout)
 
-    def go_to_joint_state(self, positions):
+    def go_to_joint_state(self, positions, joint_names=ARM_JOINTS):
         """规划并执行到一组关节角（等价于 moveit_commander 的 set_joint_value_target + go）."""
         constraints = Constraints(
-            joint_constraints=make_joint_constraints(ARM_JOINTS, positions))
+            joint_constraints=make_joint_constraints(joint_names, positions))
         return self._move(constraints)
+
+    def set_gripper(self, position):
+        """闭合/张开夹爪：对 panda_finger_joint1 发目标，由 hand 组执行."""
+        return self.go_to_joint_state([position], [GRIPPER_JOINT])
 
     def go_to_position(self, position, orientation=GRIPPER_ORIENTATION):
         """规划并执行到目标位置，并强制夹爪竖直朝下."""
@@ -194,12 +211,13 @@ class MoveGroupCommander:
 
 
 def main(args=None):
-    """脚本入口：回 Home，再去 (0.5, 0.0, 0.3)."""
+    """脚本入口：回 Home、到目标、闭合夹爪、抬起."""
     rclpy.init(args=args)
     node = rclpy.create_node('arm_pick_demo')
     try:
         robot = RobotCommander(node)
         group = MoveGroupCommander(node, 'panda_arm')
+        hand = MoveGroupCommander(node, GRIPPER_GROUP)
 
         node.get_logger().info('等待 move_group 的 %s ...' % MOVE_ACTION)
         if not group.wait_for_server(timeout=15.0):
@@ -213,6 +231,12 @@ def main(args=None):
                              for name in ARM_JOINTS if name in current]
         node.get_logger().info('当前关节角: %s' % current_positions)
 
+        # 夹爪上电时是闭合的，先张开，后面闭合时才能看出抓取动作
+        node.get_logger().info('打开夹爪 ...')
+        if not hand.set_gripper(GRIPPER_OPEN):
+            node.get_logger().error('张开夹爪失败')
+            return 1
+
         node.get_logger().info('第一步：回到 Home 姿态 ...')
         if not group.go_to_joint_state(HOME_JOINTS):
             node.get_logger().error('回 Home 失败')
@@ -223,8 +247,21 @@ def main(args=None):
         if not group.go_to_position(TARGET_POSITION):
             node.get_logger().error('前往目标点失败')
             return 1
-
         node.get_logger().info('机械臂已到达目标点！')
+
+        node.get_logger().info('第三步：闭合夹爪 ...')
+        if not hand.set_gripper(GRIPPER_CLOSED):
+            node.get_logger().error('闭合夹爪失败')
+            return 1
+        node.get_logger().info('夹爪已闭合')
+
+        lifted = lift_position(TARGET_POSITION)
+        node.get_logger().info(
+            '第四步：向上抬起 %.2f m 到 z=%.2f ...' % (LIFT_HEIGHT, lifted[2]))
+        if not group.go_to_position(lifted):
+            node.get_logger().error('抬起失败')
+            return 1
+        node.get_logger().info('抓取动作完成！')
         return 0
     finally:
         node.destroy_node()

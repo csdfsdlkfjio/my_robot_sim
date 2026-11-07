@@ -3,8 +3,9 @@
 import math
 
 from my_robot_sim.arm_pick_demo import (
-    ARM_JOINTS, BASE_FRAME, END_EFFECTOR_LINK, GRIPPER_ORIENTATION, HOME_JOINTS,
-    JOINT_TOLERANCE, ORIENTATION_TOLERANCE, TARGET_POSITION,
+    ARM_JOINTS, BASE_FRAME, END_EFFECTOR_LINK, GRIPPER_CLOSED, GRIPPER_JOINT,
+    GRIPPER_OPEN, GRIPPER_ORIENTATION, HOME_JOINTS, JOINT_TOLERANCE,
+    LIFT_HEIGHT, ORIENTATION_TOLERANCE, TARGET_POSITION, lift_position,
     make_joint_constraints, make_orientation_constraint,
     make_position_constraint)
 
@@ -82,3 +83,26 @@ def test_orientation_constraint_binds_hand_in_base_frame():
     assert constraint.absolute_y_axis_tolerance == ORIENTATION_TOLERANCE
     assert constraint.absolute_z_axis_tolerance == ORIENTATION_TOLERANCE
     assert constraint.weight == 1.0
+
+
+def test_gripper_open_and_closed_stay_within_finger_limits():
+    """闭合目标是 0，张开目标是手指行程上限 0.04 m."""
+    assert GRIPPER_CLOSED == 0.0
+    assert GRIPPER_OPEN == 0.04
+    assert 0.0 <= GRIPPER_CLOSED <= GRIPPER_OPEN
+
+
+def test_gripper_constraint_targets_finger_joint():
+    """夹爪指令必须落在 panda_finger_joint1 上（hand 组实际驱动的关节）."""
+    constraints = make_joint_constraints([GRIPPER_JOINT], [GRIPPER_CLOSED])
+    assert len(constraints) == 1
+    assert constraints[0].joint_name == 'panda_finger_joint1'
+    assert constraints[0].position == 0.0
+
+
+def test_lift_position_raises_only_z():
+    """抓取后只在 z 轴抬高 0.1 m，x/y 不变."""
+    lifted = lift_position(TARGET_POSITION)
+    assert lifted == (TARGET_POSITION[0], TARGET_POSITION[1],
+                      TARGET_POSITION[2] + LIFT_HEIGHT)
+    assert lifted[2] == 0.4
