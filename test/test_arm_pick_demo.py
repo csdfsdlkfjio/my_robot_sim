@@ -1,13 +1,17 @@
-"""机械臂演示脚本目标约束构造的单元测试."""
+"""机械臂抓取演示脚本的约束与抓取几何单元测试."""
 
 import math
 
 from my_robot_sim.arm_pick_demo import (
-    ARM_JOINTS, BASE_FRAME, END_EFFECTOR_LINK, GRIPPER_CLOSED, GRIPPER_JOINT,
-    GRIPPER_OPEN, GRIPPER_ORIENTATION, HOME_JOINTS, JOINT_TOLERANCE,
-    LIFT_HEIGHT, ORIENTATION_TOLERANCE, TARGET_POSITION, lift_position,
+    ARM_JOINTS, BASE_FRAME, BOX_CENTER, BOX_ID, BOX_SIZE, END_EFFECTOR_LINK,
+    GRASP_GRIPPER, GRIPPER_JOINT, GRIPPER_OPEN, GRIPPER_ORIENTATION,
+    HOME_JOINTS, JOINT_TOLERANCE, LIFT_HEIGHT, ORIENTATION_TOLERANCE,
+    PRE_GRASP_CLEARANCE, TOOL_LENGTH, TOUCH_LINKS, grasp_hand_position,
+    lift_position, make_attached_object, make_box_object,
     make_joint_constraints, make_orientation_constraint,
-    make_position_constraint)
+    make_position_constraint, pre_grasp_hand_position, tcp_to_hand_position)
+from moveit_msgs.msg import CollisionObject
+from shape_msgs.msg import SolidPrimitive
 
 
 def test_home_joints_match_panda_initial_positions():
@@ -16,14 +20,69 @@ def test_home_joints_match_panda_initial_positions():
     assert len(HOME_JOINTS) == len(ARM_JOINTS) == 7
 
 
-def test_target_position_is_the_requested_point():
-    """目标点必须是 x=0.5, y=0.0, z=0.3."""
-    assert TARGET_POSITION == (0.5, 0.0, 0.3)
-
-
 def test_arm_joint_names_are_panda_joints_1_to_7():
     """关节名必须按 panda_joint1..7 顺序排列."""
     assert ARM_JOINTS == tuple('panda_joint%d' % i for i in range(1, 8))
+
+
+def test_box_is_five_centimeter_cube_at_requested_center():
+    """箱子必须是 5 cm 方块，中心在 (0.5, 0, 0.25)."""
+    assert BOX_SIZE == 0.05
+    assert BOX_CENTER == (0.5, 0.0, 0.25)
+
+
+def test_box_object_message_matches_box_constants():
+    """加入场景的 CollisionObject 必须是方块、ADD、位姿正确."""
+    obj = make_box_object()
+    assert obj.id == BOX_ID
+    assert obj.header.frame_id == BASE_FRAME == 'panda_link0'
+    assert obj.operation == CollisionObject.ADD
+    assert len(obj.primitives) == len(obj.primitive_poses) == 1
+
+    primitive = obj.primitives[0]
+    assert primitive.type == SolidPrimitive.BOX
+    assert list(primitive.dimensions) == [BOX_SIZE] * 3
+
+    center = obj.primitive_poses[0].position
+    assert (center.x, center.y, center.z) == BOX_CENTER
+
+
+def test_tcp_to_hand_position_offsets_only_z():
+    """panda_hand 在抓取点上方 TOOL_LENGTH 处."""
+    assert TOOL_LENGTH == 0.1122
+    hand = tcp_to_hand_position((0.5, 0.0, 0.25))
+    assert hand == (0.5, 0.0, 0.25 + TOOL_LENGTH)
+
+
+def test_grasp_hand_position_puts_fingertips_at_box_center():
+    """抓取时指尖必须停在箱心，而不是让连杆插进箱子里."""
+    hand = grasp_hand_position()
+    fingertip_z = hand[2] - TOOL_LENGTH
+    assert abs(fingertip_z - BOX_CENTER[2]) < 1e-9
+
+
+def test_pre_grasp_is_five_centimeters_above_box_center():
+    """预抓取时指尖停在箱心正上方 5 cm."""
+    hand = pre_grasp_hand_position()
+    fingertip_z = hand[2] - TOOL_LENGTH
+    assert abs(fingertip_z - (BOX_CENTER[2] + PRE_GRASP_CLEARANCE)) < 1e-9
+    assert abs(PRE_GRASP_CLEARANCE - 0.05) < 1e-9
+
+
+def test_attach_and_detach_messages_use_hand_and_fingers():
+    """挂载/卸载必须作用在 panda_hand 上，并放开手指与箱子的碰撞."""
+
+    def check(operation):
+        message = make_attached_object(operation=operation)
+        assert message.link_name == END_EFFECTOR_LINK == 'panda_hand'
+        assert message.object.id == BOX_ID
+        assert message.object.operation == operation
+        assert tuple(message.touch_links) == TOUCH_LINKS
+        assert 'panda_leftfinger' in TOUCH_LINKS
+        assert 'panda_rightfinger' in TOUCH_LINKS
+
+    check(CollisionObject.ADD)
+    check(CollisionObject.REMOVE)
 
 
 def test_joint_constraints_cover_every_joint():
@@ -37,9 +96,9 @@ def test_joint_constraints_cover_every_joint():
         assert constraint.weight == 1.0
 
 
-def test_position_constraint_uses_sphere_at_target():
-    """位置约束应是落在目标点上的小球，且绑定末端连杆."""
-    constraint = make_position_constraint(END_EFFECTOR_LINK, TARGET_POSITION)
+def test_position_constraint_uses_sphere_at_box_center():
+    """位置约束应是落在箱心上的小球，且绑定末端连杆."""
+    constraint = make_position_constraint(END_EFFECTOR_LINK, BOX_CENTER)
     assert constraint.header.frame_id == BASE_FRAME == 'panda_link0'
     assert constraint.link_name == END_EFFECTOR_LINK == 'panda_hand'
 
@@ -48,7 +107,7 @@ def test_position_constraint_uses_sphere_at_target():
     assert region.primitives[0].type == region.primitives[0].SPHERE
 
     center = region.primitive_poses[0].position
-    assert (center.x, center.y, center.z) == TARGET_POSITION
+    assert (center.x, center.y, center.z) == BOX_CENTER
 
 
 def test_gripper_orientation_is_unit_quaternion():
@@ -85,24 +144,24 @@ def test_orientation_constraint_binds_hand_in_base_frame():
     assert constraint.weight == 1.0
 
 
-def test_gripper_open_and_closed_stay_within_finger_limits():
-    """闭合目标是 0，张开目标是手指行程上限 0.04 m."""
-    assert GRIPPER_CLOSED == 0.0
+def test_gripper_stops_at_the_box_faces():
+    """闭合位置等于箱子半边宽，手指正好合到箱子两侧."""
+    assert GRASP_GRIPPER == BOX_SIZE / 2
     assert GRIPPER_OPEN == 0.04
-    assert 0.0 <= GRIPPER_CLOSED <= GRIPPER_OPEN
+    assert 0.0 < GRASP_GRIPPER < GRIPPER_OPEN
 
 
-def test_gripper_constraint_targets_finger_joint():
+def test_grasp_constraint_targets_finger_joint():
     """夹爪指令必须落在 panda_finger_joint1 上（hand 组实际驱动的关节）."""
-    constraints = make_joint_constraints([GRIPPER_JOINT], [GRIPPER_CLOSED])
+    constraints = make_joint_constraints([GRIPPER_JOINT], [GRASP_GRIPPER])
     assert len(constraints) == 1
     assert constraints[0].joint_name == 'panda_finger_joint1'
-    assert constraints[0].position == 0.0
+    assert constraints[0].position == GRASP_GRIPPER
 
 
 def test_lift_position_raises_only_z():
     """抓取后只在 z 轴抬高 0.1 m，x/y 不变."""
-    lifted = lift_position(TARGET_POSITION)
-    assert lifted == (TARGET_POSITION[0], TARGET_POSITION[1],
-                      TARGET_POSITION[2] + LIFT_HEIGHT)
-    assert lifted[2] == 0.4
+    grasp = grasp_hand_position()
+    lifted = lift_position(grasp)
+    assert lifted == (grasp[0], grasp[1], grasp[2] + LIFT_HEIGHT)
+    assert abs(lifted[2] - (BOX_CENTER[2] + TOOL_LENGTH + LIFT_HEIGHT)) < 1e-9
