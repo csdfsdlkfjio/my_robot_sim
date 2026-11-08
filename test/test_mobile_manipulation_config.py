@@ -115,6 +115,7 @@ def test_launch_starts_gazebo_ros2_control_and_moveit():
         'MoveItConfigsBuilder',
         'panda_arm_controller',
         'panda_hand_controller',
+        "name='mobile_robot_state_publisher'",
     ):
         assert token in source, 'launch is missing %s' % token
     # The ros2_control YAML is referenced from the model's Gazebo plugin,

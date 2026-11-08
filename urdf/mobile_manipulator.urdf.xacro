@@ -136,7 +136,12 @@
       <!-- xacro 在生成 URDF 时把 $(find ...) 展开成安装目录的绝对路径 -->
       <parameters>$(find my_robot_sim)/config/mobile_manip_controllers.yaml</parameters>
       <robot_param>robot_description</robot_param>
-      <robot_param_node>robot_state_publisher</robot_param_node>
+      <!-- Must match the launch's robot_state_publisher node name. move_group
+           also runs a node called robot_state_publisher, and with two nodes
+           of that name the plugin's parameter request can be answered by the
+           wrong one (unsanitized description -> controller_manager fails to
+           start). A unique name removes the race. -->
+      <robot_param_node>mobile_robot_state_publisher</robot_param_node>
     </plugin>
   </gazebo>
 

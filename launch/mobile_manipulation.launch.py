@@ -84,10 +84,13 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('gui')),
     )
 
+    # The node name is part of the contract: the URDF's gazebo_ros2_control
+    # plugin reads robot_description from this node, and move_group already
+    # runs a node called robot_state_publisher, so a unique name is needed.
     robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
-        name='robot_state_publisher',
+        name='mobile_robot_state_publisher',
         output='screen',
         parameters=[{
             'robot_description': robot_description,

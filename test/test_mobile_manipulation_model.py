@@ -149,7 +149,7 @@ def test_gazebo_ros2_control_plugin_is_configured(robot):
         'config/mobile_manip_controllers.yaml')
     assert os.path.isabs(parameters.text.strip())
     assert plugin.find('robot_param_node').text.strip() == \
-        'robot_state_publisher'
+        'mobile_robot_state_publisher'
 
 
 def test_mesh_uris_are_absolute_file_urls(robot):
