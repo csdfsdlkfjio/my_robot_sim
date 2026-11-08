@@ -151,6 +151,15 @@ def test_launch_starts_gazebo_ros2_control_and_moveit():
     # which test_mobile_manipulation_model already checks.
 
 
+def test_launch_spawns_the_cube_after_the_pedestal():
+    """Parallel spawns let the free cube fall through the missing pedestal."""
+    with open(LAUNCH, encoding='utf-8') as handle:
+        source = handle.read()
+    assert 'OnProcessExit' in source
+    assert 'target_action=pedestal_spawner' in source
+    assert 'on_exit=[box_spawner]' in source
+
+
 def test_launch_loads_the_effort_controller_inactive():
     """switch_controller can only activate a controller that is loaded."""
     with open(LAUNCH, encoding='utf-8') as handle:

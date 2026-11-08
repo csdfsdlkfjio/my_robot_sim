@@ -19,9 +19,11 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    RegisterEventHandler,
     TimerAction,
 )
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -130,11 +132,8 @@ def generate_launch_description():
             handle.write(builder(grasp))
         grasp_files[entity] = path
 
-    grasp_spawners = []
-    for entity, position in (('grasp_box', (grasp['x'], grasp['y'],
-                                            grasp['z'])),
-                             ('grasp_pedestal', pedestal_pose(grasp))):
-        grasp_spawners.append(Node(
+    def grasp_spawner(entity, position):
+        return Node(
             package='gazebo_ros',
             executable='spawn_entity.py',
             arguments=[
@@ -145,6 +144,21 @@ def generate_launch_description():
                 '-z', '%g' % position[2],
             ],
             output='screen',
+        )
+
+    # Spawners started together run in parallel. The cube is free to fall, so
+    # if it reaches the world before the static pedestal it drops through the
+    # empty space where the pedestal will appear and ends up embedded. Chain
+    # the cube spawn on the pedestal spawner's exit so the support is there
+    # first.
+    pedestal_spawner = grasp_spawner(
+        'grasp_pedestal', pedestal_pose(grasp))
+    box_spawner = grasp_spawner(
+        'grasp_box', (grasp['x'], grasp['y'], grasp['z']))
+    spawn_box_after_pedestal = RegisterEventHandler(
+        OnProcessExit(
+            target_action=pedestal_spawner,
+            on_exit=[box_spawner],
         ))
 
     # gazebo_ros2_control creates /controller_manager inside gzserver. The
@@ -232,7 +246,8 @@ def generate_launch_description():
         gzclient,
         robot_state_publisher,
         spawn_entity,
-        *grasp_spawners,
+        pedestal_spawner,
+        spawn_box_after_pedestal,
         TimerAction(period=3.0, actions=controller_spawners),
         move_group,
         rviz,
