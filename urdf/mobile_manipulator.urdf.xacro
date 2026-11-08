@@ -1,0 +1,143 @@
+<?xml version="1.0"?>
+<!--
+  移动抓取机器人：差速底盘 my_car + Franka Panda 七自由度机械臂。
+
+  控制划分（互不重叠，因此不会抢同一个关节）：
+    * 左/右轮：gazebo_ros_diff_drive 插件（cmd_vel / odom），沿用 my_car.urdf。
+    * 机械臂 + 夹爪：gazebo_ros2_control -> controller_manager ->
+      panda_arm_controller / panda_hand_controller。
+
+  轮子没有写进 <ros2_control>，机械臂也没有写进差速插件，所以两套控制
+  可以同时运行。轮子的 /joint_states 由 my_car.urdf 里的
+  gazebo_ros_joint_state_publisher 发布，Panda 的由 joint_state_broadcaster
+  发布，二者合并在同一个 /joint_states 话题上。
+-->
+<robot name="mobile_manipulator" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ================= 1. 原有差速底盘（原样复用） ================= -->
+  <xacro:include filename="$(find my_robot_sim)/urdf/my_car.urdf"/>
+
+  <!-- ================= 2. 机械臂安装板 ================= -->
+  <!-- base_link 是 0.4 x 0.25 x 0.05 的盒子，顶面在 z=+0.025。
+       安装板厚 0.01，中心放在 z=0.03，顶面正好 z=0.035。
+       机械臂略靠后（x=-0.04），让伸臂时的重心仍落在轮轴与万向轮之间。 -->
+  <link name="arm_mount_link">
+    <visual>
+      <geometry><box size="0.12 0.12 0.01"/></geometry>
+      <material name="mount_gray"><color rgba="0.35 0.35 0.35 1.0"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="0.12 0.12 0.01"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.2"/>
+      <inertia ixx="0.000242" iyy="0.000242" izz="0.000480"
+               ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="arm_mount_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="arm_mount_link"/>
+    <origin xyz="-0.04 0 0.03"/>
+  </joint>
+
+  <!-- ================= 3. 底盘配重（电池包） ================= -->
+  <!-- 原来的车只有约 1.6 kg，Panda 即使按 10% 质量缩放也有约 1.7 kg。
+       臂伸到前方 0.5 m 时若没有配重，重心会越过驱动轮（x=+0.1）导致翻车。
+       这块 2.5 kg 的电池包挂在车底，把重心拉回支撑多边形内。 -->
+  <link name="ballast_link">
+    <visual>
+      <geometry><box size="0.30 0.20 0.06"/></geometry>
+      <material name="battery_dark"><color rgba="0.15 0.15 0.18 1.0"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="0.30 0.20 0.06"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="2.5"/>
+      <inertia ixx="0.009083" iyy="0.019500" izz="0.027083"
+               ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="ballast_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="ballast_link"/>
+    <!-- 车底板在 z=-0.025，电池包顶面也放在 z=-0.025 -->
+    <origin xyz="-0.05 0 -0.055"/>
+  </joint>
+
+  <!-- ================= 4. Panda 机械臂（带 Gazebo 惯量） ================= -->
+  <xacro:include filename="$(find my_robot_sim)/urdf/panda_with_inertia.urdf.xacro"/>
+
+  <!-- panda_link0 原点位于臂座底面，安装板顶面是 z=0.035 -->
+  <joint name="panda_base_joint" type="fixed">
+    <parent link="arm_mount_link"/>
+    <child link="panda_link0"/>
+    <origin xyz="0 0 0.005"/>
+  </joint>
+
+  <!-- ================= 5. 机械臂 ros2_control（Gazebo 硬件） ================= -->
+  <!-- 只包含 Panda 的 9 个关节；轮子交给差速插件，绝不重复。 -->
+  <ros2_control name="PandaGazeboSystem" type="system">
+    <hardware>
+      <plugin>gazebo_ros2_control/GazeboSystem</plugin>
+    </hardware>
+
+    <joint name="panda_joint1">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="panda_joint2">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="panda_joint3">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="panda_joint4">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="panda_joint5">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="panda_joint6">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="panda_joint7">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="panda_finger_joint1">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="panda_finger_joint2">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+  </ros2_control>
+
+  <!-- ================= 6. 启动 Gazebo 里的 ros2_control ================= -->
+  <gazebo>
+    <plugin name="gazebo_ros2_control" filename="libgazebo_ros2_control.so">
+      <!-- xacro 在生成 URDF 时把 $(find ...) 展开成安装目录的绝对路径 -->
+      <parameters>$(find my_robot_sim)/config/mobile_manip_controllers.yaml</parameters>
+      <robot_param>robot_description</robot_param>
+      <robot_param_node>robot_state_publisher</robot_param_node>
+    </plugin>
+  </gazebo>
+
+</robot>
