@@ -121,12 +121,20 @@ def test_launch_starts_gazebo_ros2_control_and_moveit():
     # which test_mobile_manipulation_model already checks.
 
 
-def test_launch_collapses_robot_description_whitespace():
-    """A multi-line description breaks gazebo_ros2_control's --param rule."""
+def test_launch_sanitizes_the_robot_description():
+    """A raw description breaks gazebo_ros2_control's --param rule."""
     with open(LAUNCH, encoding='utf-8') as handle:
         source = handle.read()
+    # Comments must go: a ': ' or a '*'-leading line inside one makes rcl
+    # reject the --param override, and the plugin then starts without a
+    # controller manager.
+    assert "re.sub(r'<!--.*?-->', '', description" in source
     assert "' '.join(" in source
-    assert "robot_description'].split()" in source
+    # move_group's internal robot_state_publisher must serve the same text,
+    # otherwise which node answers the plugin's parameter request decides
+    # whether the controller manager starts.
+    assert \
+        "moveit_config.robot_description['robot_description'] = " in source
 
 
 def test_launch_does_not_start_the_task_node():

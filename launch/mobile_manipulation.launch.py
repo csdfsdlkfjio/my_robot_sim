@@ -11,6 +11,7 @@ The launch does NOT start the task node; run it separately:
 """
 
 import os
+import re
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -51,13 +52,18 @@ def generate_launch_description():
     )
     # gazebo_ros2_control copies robot_state_publisher's description into the
     # controller_manager node as a ``--param robot_description:=...`` command
-    # line override. rcl parses that value as YAML, and a multi-line value
-    # whose lines start with '*' (xacro comments do) is rejected, which makes
-    # the plugin start without a controller manager. Collapsing the whitespace
-    # keeps the XML semantics identical while making the override a plain
-    # single-line scalar. MoveIt still receives the original multi-line text.
+    # line override. rcl parses that value as YAML, so a multi-line value, a
+    # line starting with '*', or a ``: `` inside an XML comment makes the
+    # parse fail and leaves the plugin without a controller manager.
+    #
+    # move_group also runs an internal node called robot_state_publisher, so
+    # the plugin's parameter request can be answered by either node. Hand both
+    # the same comment-free single-line text so the answer never depends on
+    # the race.
+    description = moveit_config.robot_description['robot_description']
     robot_description = ' '.join(
-        moveit_config.robot_description['robot_description'].split())
+        re.sub(r'<!--.*?-->', '', description, flags=re.S).split())
+    moveit_config.robot_description['robot_description'] = robot_description
 
     gazebo_share = get_package_share_directory('gazebo_ros')
     default_world = os.path.join(gazebo_share, 'worlds', 'empty.world')
