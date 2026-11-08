@@ -165,6 +165,47 @@ def test_mesh_uris_are_absolute_file_urls(robot):
         assert filename.startswith('file:///'), filename
 
 
+def test_every_panda_link_gets_a_gazebo_material(robot):
+    """
+    Gazebo Classic does not draw mesh visuals that have no material.
+
+    URDF <material> colours never reach the SDF, so the material has to be
+    passed through <gazebo reference> blocks: without them the arm is
+    simulated but invisible in gzclient.
+    """
+    references = {
+        block.get('reference'): block
+        for block in robot.findall('gazebo')
+        if block.get('reference') is not None
+        and block.find('material') is not None
+    }
+    panda_links = ['panda_link%d' % index for index in range(8)]
+    panda_links += ['panda_hand', 'panda_leftfinger', 'panda_rightfinger']
+    for link in panda_links:
+        assert link in references, '%s has no gazebo material' % link
+        assert references[link].findtext('material').strip() == 'Gazebo/White'
+
+
+def test_gazebo_sdf_conversion_keeps_the_panda_material(urdf_text):
+    """The gazebo reference material must survive the conversion to SDF."""
+    with tempfile.NamedTemporaryFile(
+            'w', suffix='.urdf', delete=False) as handle:
+        handle.write(urdf_text)
+        path = handle.name
+    try:
+        result = subprocess.run(
+            ['gz', 'sdf', '-p', path], capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, result.stderr
+    root = ET.fromstring(result.stdout)
+    link = next(item for item in root.iter('link')
+                if item.get('name') == 'panda_link1')
+    visual = link.find('visual')
+    name = visual.find('material/script/name')
+    assert name is not None and name.text.strip() == 'Gazebo/White'
+
+
 def test_gazebo_sdf_conversion_keeps_all_links(urdf_text):
     """The gz sdf conversion must keep a non-empty model with all links."""
     with tempfile.NamedTemporaryFile(
