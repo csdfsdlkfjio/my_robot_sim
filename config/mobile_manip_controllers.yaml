@@ -1,0 +1,55 @@
+# ros2_control controllers used by gazebo_ros2_control for the Panda arm.
+#
+# The differential drive is NOT here: the wheels are still driven by
+# libgazebo_ros_diff_drive.so inside my_car.urdf. Different joints, no conflict.
+controller_manager:
+  ros__parameters:
+    update_rate: 100  # Hz
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    panda_arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    # Both fingers are actively position-controlled. Gazebo Classic does not
+    # implement URDF <mimic> for physics, so controlling both keeps the gripper
+    # symmetric instead of leaving panda_finger_joint2 free.
+    panda_hand_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+
+panda_arm_controller:
+  ros__parameters:
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    joints:
+      - panda_joint1
+      - panda_joint2
+      - panda_joint3
+      - panda_joint4
+      - panda_joint5
+      - panda_joint6
+      - panda_joint7
+    allow_partial_joints_goal: false
+    constraints:
+      stopped_velocity_tolerance: 0.05
+      goal_time: 1.5
+
+panda_hand_controller:
+  ros__parameters:
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    joints:
+      - panda_finger_joint1
+      - panda_finger_joint2
+    allow_partial_joints_goal: false
+    constraints:
+      stopped_velocity_tolerance: 0.05
+      goal_time: 1.0
