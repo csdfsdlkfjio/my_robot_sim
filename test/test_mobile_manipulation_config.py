@@ -86,6 +86,14 @@ def test_srdf_hand_group_matches_controller():
     assert passive == set()
 
 
+def test_srdf_robot_name_matches_the_merged_urdf():
+    """The SRDF and URDF robot names must match or MoveIt logs an error."""
+    urdf = ET.parse(os.path.join(PKG_ROOT, 'urdf',
+                                 'mobile_manipulator.urdf.xacro')).getroot()
+    srdf = ET.parse(SRDF).getroot()
+    assert srdf.get('name') == urdf.get('name') == 'mobile_manipulator'
+
+
 def test_srdf_has_no_virtual_joint_to_panda_link0():
     """The merged URDF already fixes panda_link0 to the base."""
     root = ET.parse(SRDF).getroot()
