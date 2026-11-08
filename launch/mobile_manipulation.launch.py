@@ -12,6 +12,7 @@ The launch does NOT start the task node; run it separately:
 
 import os
 import re
+import tempfile
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -25,6 +26,13 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from moveit_configs_utils import MoveItConfigsBuilder
+
+from my_robot_sim.grasp_box import (
+    box_sdf,
+    load_config,
+    pedestal_pose,
+    pedestal_sdf,
+)
 
 
 def generate_launch_description():
@@ -109,6 +117,36 @@ def generate_launch_description():
         output='screen',
     )
 
+    # The grasp cube and the pedestal holding it up are described by
+    # config/grasp_box.yaml. spawn_entity.py only accepts files, so render the
+    # SDF text once at launch time into a temporary directory.
+    grasp = load_config(os.path.join(pkg_share, 'config', 'grasp_box.yaml'))
+    grasp_sdf_dir = tempfile.mkdtemp(prefix='my_robot_sim_grasp_')
+    grasp_files = {}
+    for entity, builder in (('grasp_box', box_sdf),
+                            ('grasp_pedestal', pedestal_sdf)):
+        path = os.path.join(grasp_sdf_dir, entity + '.sdf')
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write(builder(grasp))
+        grasp_files[entity] = path
+
+    grasp_spawners = []
+    for entity, position in (('grasp_box', (grasp['x'], grasp['y'],
+                                            grasp['z'])),
+                             ('grasp_pedestal', pedestal_pose(grasp))):
+        grasp_spawners.append(Node(
+            package='gazebo_ros',
+            executable='spawn_entity.py',
+            arguments=[
+                '-entity', entity,
+                '-file', grasp_files[entity],
+                '-x', '%g' % position[0],
+                '-y', '%g' % position[1],
+                '-z', '%g' % position[2],
+            ],
+            output='screen',
+        ))
+
     # gazebo_ros2_control creates /controller_manager inside gzserver. The
     # spawners wait for that service, so the timer only avoids noisy retries.
     controller_spawners = [
@@ -139,6 +177,20 @@ def generate_launch_description():
                 'panda_hand_controller',
                 '-c', '/controller_manager',
                 '--controller-manager-timeout', '60',
+            ],
+            output='screen',
+        ),
+        # The task node swaps the hand to this controller to press the cube
+        # with a constant force. It has to be loaded (configured, inactive)
+        # up front: switch_controller can only activate a loaded controller.
+        Node(
+            package='controller_manager',
+            executable='spawner',
+            arguments=[
+                'panda_hand_effort_controller',
+                '-c', '/controller_manager',
+                '--controller-manager-timeout', '60',
+                '--inactive',
             ],
             output='screen',
         ),
@@ -180,6 +232,7 @@ def generate_launch_description():
         gzclient,
         robot_state_publisher,
         spawn_entity,
+        *grasp_spawners,
         TimerAction(period=3.0, actions=controller_spawners),
         move_group,
         rviz,

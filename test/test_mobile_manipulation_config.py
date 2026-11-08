@@ -86,6 +86,30 @@ def test_srdf_hand_group_matches_controller():
     assert passive == set()
 
 
+def test_hand_uses_position_and_effort_controllers():
+    """Opening is position-controlled; the squeeze needs a real force."""
+    config = load_yaml(CONTROLLERS)
+    hand = config['panda_hand_controller']['ros__parameters']
+    assert hand['command_interfaces'] == ['position']
+    assert set(hand['state_interfaces']) == {'position', 'velocity'}
+
+    manager = config['controller_manager']['ros__parameters']
+    assert manager['panda_hand_effort_controller']['type'] == \
+        'effort_controllers/JointGroupEffortController'
+    effort = config['panda_hand_effort_controller']['ros__parameters']
+    assert set(effort['joints']) == {
+        'panda_finger_joint1', 'panda_finger_joint2'}
+
+
+def test_finger_controllers_tolerate_the_grasp_squeeze():
+    """The fingers stop against the cube a few mm short of the target."""
+    config = load_yaml(CONTROLLERS)
+    constraints = config['panda_hand_controller']['ros__parameters'][
+        'constraints']
+    for joint in ('panda_finger_joint1', 'panda_finger_joint2'):
+        assert constraints[joint]['goal'] >= 0.005, joint
+
+
 def test_srdf_robot_name_matches_the_merged_urdf():
     """The SRDF and URDF robot names must match or MoveIt logs an error."""
     urdf = ET.parse(os.path.join(PKG_ROOT, 'urdf',
@@ -116,10 +140,23 @@ def test_launch_starts_gazebo_ros2_control_and_moveit():
         'panda_arm_controller',
         'panda_hand_controller',
         "name='mobile_robot_state_publisher'",
+        'grasp_box.yaml',
+        'grasp_box',
+        'grasp_pedestal',
+        'box_sdf',
+        'pedestal_sdf',
     ):
         assert token in source, 'launch is missing %s' % token
     # The ros2_control YAML is referenced from the model's Gazebo plugin,
     # which test_mobile_manipulation_model already checks.
+
+
+def test_launch_loads_the_effort_controller_inactive():
+    """switch_controller can only activate a controller that is loaded."""
+    with open(LAUNCH, encoding='utf-8') as handle:
+        source = handle.read()
+    assert "'panda_hand_effort_controller'" in source
+    assert "'--inactive'" in source
 
 
 def test_launch_sanitizes_the_robot_description():
