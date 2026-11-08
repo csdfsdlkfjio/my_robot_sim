@@ -14,11 +14,17 @@ setup(
         ('share/' + package_name, ['package.xml']),
         # 下面这两行是核心！让系统把 launch 和 urdf 文件装进去
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        # 合并模型是 xacro（urdf/*.urdf.xacro），必须一起装进去
         (os.path.join('share', package_name, 'urdf'), glob('urdf/*.urdf')),
+        (os.path.join('share', package_name, 'urdf'),
+            glob('urdf/*.urdf.xacro')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
         # Nav2 参数：AMCL 的 base_frame_id 改成了 base_link
+        # 机械臂控制器参数（yaml）和 SRDF（srdf）也放在这里
         (os.path.join('share', package_name, 'config'),
             glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'config'),
+            glob('config/*.srdf')),
         # 地图和世界文件必须安装到 share，否则 map_server 找不到 yaml
         (os.path.join('share', package_name, 'maps'), glob('maps/*')),
         (os.path.join('share', package_name, 'worlds'), glob('worlds/*.world')),
@@ -32,6 +38,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'mobile_manipulation_node = '
+            'my_robot_sim.mobile_manipulation_node:main',
         ],
     },
 )
