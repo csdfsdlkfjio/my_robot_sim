@@ -110,6 +110,36 @@ def test_diff_drive_plugin_owns_only_wheels(robot):
     assert diff_drive.find('publish_odom_tf').text.strip() == 'true'
 
 
+def test_ground_truth_odometry_plugin_tracks_base_link(robot):
+    """Grasp geometry needs the true base pose, not slipping wheel odometry."""
+    plugins = {
+        plugin.get('name'): plugin for plugin in robot.iter('plugin')}
+    plugin = plugins['ground_truth_odometry']
+    assert plugin.get('filename') == 'libgazebo_ros_p3d.so'
+    assert plugin.find('body_name').text.strip() == 'base_link'
+    assert plugin.find('frame_name').text.strip() == 'world'
+    # The Humble plugin hardcodes its publisher to "odom", so the topic must
+    # be remapped away from the differential-drive /odom.
+    assert plugin.find('ros/remapping').text.strip() == \
+        'odom:=ground_truth/odom'
+    assert float(plugin.find('update_rate').text) > 0.0
+    assert float(plugin.find('gaussian_noise').text) == 0.0
+
+
+def test_robot_model_loads_the_grasp_attach_plugin(robot):
+    """
+    A URDF plugin is loaded by file name, not by package path.
+
+    The launch file puts my_robot_grasp_attach's lib directory on
+    GAZEBO_PLUGIN_PATH; this test pins the file name the URDF asks for. Without
+    the plugin the cube stays on its pedestal when the arm lifts.
+    """
+    plugins = {
+        plugin.get('name'): plugin for plugin in robot.iter('plugin')}
+    plugin = plugins['grasp_attach']
+    assert plugin.get('filename') == 'libgazebo_grasp_attach.so'
+
+
 def test_ros2_control_owns_only_the_arm(robot):
     """Every <ros2_control> joint must be a Panda joint, never a wheel."""
     systems = robot.findall('ros2_control')
@@ -121,6 +151,31 @@ def test_ros2_control_owns_only_the_arm(robot):
     controlled = {
         joint.get('name') for joint in system.findall('joint')}
     assert controlled == PANDA_JOINTS | HAND_JOINTS
+
+
+def test_fingers_expose_position_and_effort_commands(robot):
+    """
+    The hand switches controllers between opening and squeezing.
+
+    Position is needed for opening/pre-close, but a position command is a
+    teleport in gazebo_ros2_control: the pad would be placed inside the cube
+    and the contact would eject it, giving no steady normal force. The effort
+    interface is what makes the squeeze physical. Both therefore have to reach
+    the hardware through the URDF.
+    """
+    system = robot.find('ros2_control')
+    joints = {
+        joint.get('name'): joint for joint in system.findall('joint')}
+    for name in ('panda_finger_joint1', 'panda_finger_joint2'):
+        interfaces = {
+            interface.get('name')
+            for interface in joints[name].findall('command_interface')}
+        assert interfaces == {'position', 'effort'}, name
+    for name in ('panda_joint1', 'panda_joint7'):
+        interfaces = {
+            interface.get('name')
+            for interface in joints[name].findall('command_interface')}
+        assert interfaces == {'position'}, name
 
 
 def test_control_paths_are_disjoint(robot):
@@ -184,6 +239,77 @@ def test_every_panda_link_gets_a_gazebo_material(robot):
     for link in panda_links:
         assert link in references, '%s has no gazebo material' % link
         assert references[link].findtext('material').strip() == 'Gazebo/White'
+
+
+def test_fingers_use_a_flat_box_pad_for_grasping(robot):
+    """
+    finger.stl's inner face is recessed above z = 0.036.
+
+    A cube gripped at the hand origin only touches the last 1.8 cm of the
+    mesh and slips out. The collision must therefore be the full-height box
+    envelope, while the visual keeps the original DAE.
+
+    Each pad must sit on its own side of the link origin: the finger link
+    plane is the grasp face, and the 2.65 cm thick pad extends outward from
+    it. A rotation cannot mirror a box (it is symmetric about its centre), so
+    the right pad is mirrored by a negative y offset; a positive offset there
+    would put the pad inside the grasp gap and through the cube.
+    """
+    links = named(robot, 'link')
+    offsets = {'panda_leftfinger': 0.01315, 'panda_rightfinger': -0.01315}
+    for name, offset in offsets.items():
+        collision = links[name].find('collision')
+        assert collision is not None, name
+        box = collision.find('geometry/box')
+        assert box is not None, '%s collision is not a box' % name
+        assert collision.find('geometry/mesh') is None, name
+        assert [float(value) for value in box.get('size').split()] == \
+            pytest.approx([0.040, 0.0265, 0.0538])
+        origin = collision.find('origin')
+        assert float(origin.get('xyz').split()[1]) == pytest.approx(offset)
+        assert [float(value) for value in origin.get('rpy').split()] == \
+            pytest.approx([0.0, 0.0, 0.0])
+        # The visual must keep the real finger shape.
+        assert links[name].find('visual/geometry/mesh') is not None, name
+
+
+def test_fingers_carry_grasp_contact_parameters_into_the_sdf(urdf_text):
+    """
+    The physical grasp is held by friction alone.
+
+    The finger <gazebo reference> blocks must therefore reach the SDF as
+    high-friction, stiff contacts. A soft contact (kp = 1e6) was measured to
+    let the pads slide up the cube with no vertical force at all, so the
+    stiffness matters as much as mu. The values mirror Gazebo's
+    friction_demo.world.
+    """
+    with tempfile.NamedTemporaryFile(
+            'w', suffix='.urdf', delete=False) as handle:
+        handle.write(urdf_text)
+        path = handle.name
+    try:
+        result = subprocess.run(
+            ['gz', 'sdf', '-p', path], capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, result.stderr
+    root = ET.fromstring(result.stdout)
+    for name in ('panda_leftfinger', 'panda_rightfinger'):
+        link = next(item for item in root.iter('link')
+                    if item.get('name') == name)
+        collision = link.find('collision')
+        assert float(collision.findtext(
+            'surface/friction/ode/mu')) >= 1.0, name
+        assert float(collision.findtext(
+            'surface/friction/ode/mu2')) >= 1.0, name
+        # Match the friction demo: a stiff contact keeps the friction
+        # constraint from slipping.
+        assert float(collision.findtext(
+            'surface/contact/ode/kp')) >= 1e9, name
+        assert float(collision.findtext(
+            'surface/contact/ode/max_vel')) >= 100.0, name
+        assert float(collision.findtext(
+            'surface/contact/ode/min_depth')) > 0.0, name
 
 
 def test_gazebo_sdf_conversion_keeps_the_panda_material(urdf_text):

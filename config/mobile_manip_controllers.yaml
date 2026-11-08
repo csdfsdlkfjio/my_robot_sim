@@ -12,11 +12,20 @@ controller_manager:
     panda_arm_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
-    # Both fingers are actively position-controlled. Gazebo Classic does not
-    # implement URDF <mimic> for physics, so controlling both keeps the gripper
-    # symmetric instead of leaving panda_finger_joint2 free.
+    # Position control for opening the gripper and for the pre-close move.
+    # Gazebo Classic does not implement URDF <mimic> for physics, so
+    # controlling both keeps the gripper symmetric instead of leaving
+    # panda_finger_joint2 free.
     panda_hand_controller:
       type: joint_trajectory_controller/JointTrajectoryController
+
+    # Constant-force squeeze for the grasp itself. A position command is a
+    # teleport in gazebo_ros2_control: the pad lands inside the cube, the
+    # contact shoves the cube away and no steady normal force exists. A
+    # position-derived PID (in the JTC) oscillates far too violently for a
+    # 15 g finger, so the grasp uses this open-loop effort controller instead.
+    panda_hand_effort_controller:
+      type: effort_controllers/JointGroupEffortController
 
 
 panda_arm_controller:
@@ -53,3 +62,17 @@ panda_hand_controller:
     constraints:
       stopped_velocity_tolerance: 0.05
       goal_time: 1.0
+      # When the fingers squeeze the grasp cube they stop a few millimetres
+      # short of their commanded position. Without a per-joint goal tolerance
+      # the controller would report GOAL_TOLERANCE_VIOLATED and MoveIt would
+      # treat the grasp as a failed trajectory.
+      panda_finger_joint1:
+        goal: 0.01
+      panda_finger_joint2:
+        goal: 0.01
+
+panda_hand_effort_controller:
+  ros__parameters:
+    joints:
+      - panda_finger_joint1
+      - panda_finger_joint2

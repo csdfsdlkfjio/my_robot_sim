@@ -34,6 +34,26 @@
             <material>Gazebo/White</material>
         </gazebo>
     </xacro:macro>
+
+    <!-- The fingers are the only links that touch the grasp cube, so they
+         carry the contact parameters the friction grasp needs: high friction
+         to carry the cube, and a stiff contact. A soft contact (the earlier
+         kp = 1e6 experiment) lets ODE's friction constraint slip completely:
+         the pads were stopped by the cube's faces but slid up them under the
+         full weight of the cube. These values match Gazebo's own
+         friction_demo.world (kp = 1e9, kd = 1, maxVel = 100,
+         minDepth = 0.001). -->
+    <xacro:macro name="panda_finger_gazebo" params="link">
+        <gazebo reference="${link}">
+            <material>Gazebo/White</material>
+            <mu1>2.0</mu1>
+            <mu2>2.0</mu2>
+            <kp>1000000000.0</kp>
+            <kd>1.0</kd>
+            <maxVel>100.0</maxVel>
+            <minDepth>0.001</minDepth>
+        </gazebo>
+    </xacro:macro>
     <xacro:panda_gazebo_material link="panda_link0"/>
     <xacro:panda_gazebo_material link="panda_link1"/>
     <xacro:panda_gazebo_material link="panda_link2"/>
@@ -43,8 +63,8 @@
     <xacro:panda_gazebo_material link="panda_link6"/>
     <xacro:panda_gazebo_material link="panda_link7"/>
     <xacro:panda_gazebo_material link="panda_hand"/>
-    <xacro:panda_gazebo_material link="panda_leftfinger"/>
-    <xacro:panda_gazebo_material link="panda_rightfinger"/>
+    <xacro:panda_finger_gazebo link="panda_leftfinger"/>
+    <xacro:panda_finger_gazebo link="panda_rightfinger"/>
 
     <link name="panda_link0">
         <inertial>
@@ -278,9 +298,20 @@
                 <mesh filename="file://$(find moveit_resources_panda_description)/meshes/visual/finger.dae" />
             </geometry>
         </visual>
+        <!-- A box collision instead of finger.stl. The mesh's inner face is
+             flat (y = 0) only in its last 1.8 cm; higher up it is recessed by
+             1.5-2.5 cm. A cube grasped at the hand origin therefore touches
+             only that small strip and slips out of the friction grip. The box
+             reproduces the finger's thickness and height (26.5 x 53.8 mm)
+             with a full-height flat pad at y ~ 0, which is what the grasp
+             needs. It is 40 mm along x rather than the mesh's 21 mm: a 5 cm
+             cube is wider than the real finger, and the pinch on a narrow
+             strip lets the cube yaw out of the grip when the squeeze force
+             rises. The visual stays the original DAE. -->
         <collision>
+            <origin rpy="0 0 0" xyz="0 0.01315 0.0269" />
             <geometry>
-                <mesh filename="file://$(find moveit_resources_panda_description)/meshes/collision/finger.stl" />
+                <box size="0.040 0.0265 0.0538" />
             </geometry>
         </collision>
     </link>
@@ -296,10 +327,14 @@
                 <mesh filename="file://$(find moveit_resources_panda_description)/meshes/visual/finger.dae" />
             </geometry>
         </visual>
+        <!-- The pad must be mirrored by its translation, not by rpy: a box is
+             symmetric about its own centre, so a pi rotation leaves the
+             occupied volume unchanged and would keep the pad on the +y side,
+             i.e. inside the grasp gap, where it overlaps the cube. -->
         <collision>
-            <origin rpy="0 0 3.14159265359" xyz="0 0 0" />
+            <origin rpy="0 0 0" xyz="0 -0.01315 0.0269" />
             <geometry>
-                <mesh filename="file://$(find moveit_resources_panda_description)/meshes/collision/finger.stl" />
+                <box size="0.040 0.0265 0.0538" />
             </geometry>
         </collision>
     </link>

@@ -1,0 +1,47 @@
+# The cube the mobile manipulator picks up, and the static pedestal it rests
+# on.
+#
+# This file is the single source of truth: the launch file spawns both models
+# in Gazebo from it, and mobile_manipulation_node uses the same numbers for
+# its MoveIt goals and its planning-scene (RViz) collision objects.
+#
+# Poses are in the Gazebo world frame. The robot spawns at the world origin
+# and the differential-drive plugin starts /odom there, so the odom frame
+# coincides with the world frame at the start of a run.
+#
+# Note on the requested (1.0, 0, 0.25): after the requested 1.0 m drive the
+# chassis centre is already at x ~= 1.0, so a cube at x = 1.0 would sit inside
+# the robot. x = 1.45 leaves the cube ~0.49 m in front of panda_link0, which
+# is the reach this arm was verified to hold while pointing straight down.
+#
+# z = 0.25 is the cube centre, so its bottom face is at 0.225. A free cube
+# spawned there would fall, hence the static pedestal whose top face is at
+# exactly that height.
+grasp_box:
+  size: 0.05              # cube edge length [m]
+  mass: 0.05              # [kg] a 5 cm plastic cube
+  x: 1.45                 # cube centre [m], world frame
+  y: 0.0
+  z: 0.25
+  pedestal_size: 0.16     # square pedestal footprint edge [m]
+  friction: 2.0           # cube/ground contact friction coefficient
+
+  # Grasp geometry. tcp_offset is the distance from the panda_hand frame
+  # origin to the grasp point along the hand's +z axis. It has to clear the
+  # palm (0.066 m deep in the hand mesh) plus half the cube, otherwise the
+  # palm would press on the cube's top face.
+  tcp_offset: 0.10
+  approach_clearance: 0.05  # pre-grasp TCP height above the cube's top face [m]
+  # Closing the fingers is done with a constant force, not a position: a
+  # position command is a teleport in gazebo_ros2_control and produces no
+  # steady squeeze. The prismatic finger joints have 1 N of joint friction,
+  # so part of the command never reaches the cube. A large command is not
+  # better: at 8 N the light cube was squeezed out of the pinch while the
+  # fingers were still closing. 4 N seats the pads on the cube's faces without
+  # ejecting it. The lift itself is carried by the fixed joint that the
+  # my_robot_grasp_attach plugin creates in Gazebo.
+  squeeze_effort: 4.0       # [N] constant closing force per finger
+  lift_height: 0.10         # [m] how far the arm lifts after attaching
+  # MoveIt velocity scaling for the lift. A slow lift keeps the cube from
+  # swinging while the fixed joint takes up the load.
+  lift_velocity: 0.1

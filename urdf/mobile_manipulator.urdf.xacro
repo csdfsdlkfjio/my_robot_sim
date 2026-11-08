@@ -118,17 +118,60 @@
       <state_interface name="position"/>
       <state_interface name="velocity"/>
     </joint>
+    <!-- The fingers expose both command interfaces and are switched between
+         two controllers at run time. Position (the JTC) opens the gripper and
+         pre-closes it to just outside the cube. Effort (the
+         JointGroupEffortController) then presses with a constant force: a
+         position-only grasp cannot work because GazeboSystem turns a position
+         command into Joint::SetPosition, a teleport that shoves the cube away
+         instead of squeezing it. -->
     <joint name="panda_finger_joint1">
       <command_interface name="position"/>
+      <command_interface name="effort"/>
       <state_interface name="position"/>
       <state_interface name="velocity"/>
     </joint>
     <joint name="panda_finger_joint2">
       <command_interface name="position"/>
+      <command_interface name="effort"/>
       <state_interface name="position"/>
       <state_interface name="velocity"/>
     </joint>
   </ros2_control>
+
+  <!-- Ground-truth base pose. The differential-drive plugin's /odom is wheel
+       odometry: it integrates wheel rotation and does not know about slip.
+       Measured over one 1 m run it ended up ~3 cm and ~2.5 degrees away from
+       where the robot really was, which is enough to make the pads pinch only
+       the front edge of the 5 cm grasp cube instead of its faces. The grasp
+       geometry is therefore computed from this plugin's world pose, not from
+       /odom. -->
+  <gazebo>
+    <plugin name="ground_truth_odometry" filename="libgazebo_ros_p3d.so">
+      <!-- The Humble build of this plugin ignores <topic_name> and always
+           publishes to "odom"; remap it so it cannot be confused with the
+           differential-drive /odom that the drive-distance check reads. -->
+      <ros>
+        <remapping>odom:=ground_truth/odom</remapping>
+      </ros>
+      <body_name>base_link</body_name>
+      <frame_name>world</frame_name>
+      <update_rate>50.0</update_rate>
+      <gaussian_noise>0.0</gaussian_noise>
+    </plugin>
+  </gazebo>
+
+  <!-- 抓取闭合后把箱子焊到夹爪上。
+       gazebo_ros2_control 的关节位置指令在 Gazebo 里表现为瞬移，手指对箱子
+       没有持续的法向载荷，实测无论夹紧力多大、箱子多重，摩擦夹持都提不起
+       箱子（手指沿箱面上滑，箱子留在原处）。my_robot_grasp_attach 插件在
+       收到任务节点的 /grasp_attach 指令后，用物理引擎创建一个 fixed 关节，
+       箱子从此跟随 panda_hand 运动；插件在 /grasp_attach/status 上回报结果。
+       插件库由 my_robot_grasp_attach 包安装，launch 会把它加进
+       GAZEBO_PLUGIN_PATH。 -->
+  <gazebo>
+    <plugin name="grasp_attach" filename="libgazebo_grasp_attach.so"/>
+  </gazebo>
 
   <!-- ================= 6. 启动 Gazebo 里的 ros2_control ================= -->
   <gazebo>
