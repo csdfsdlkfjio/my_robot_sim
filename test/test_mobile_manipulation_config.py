@@ -121,6 +121,14 @@ def test_launch_starts_gazebo_ros2_control_and_moveit():
     # which test_mobile_manipulation_model already checks.
 
 
+def test_launch_collapses_robot_description_whitespace():
+    """A multi-line description breaks gazebo_ros2_control's --param rule."""
+    with open(LAUNCH, encoding='utf-8') as handle:
+        source = handle.read()
+    assert "' '.join(" in source
+    assert "robot_description'].split()" in source
+
+
 def test_launch_does_not_start_the_task_node():
     """The task is run in its own terminal, matching the documented flow."""
     with open(LAUNCH, encoding='utf-8') as handle:
