@@ -14,12 +14,16 @@ import os
 import re
 import tempfile
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import (
+    get_package_prefix,
+    get_package_share_directory,
+)
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     RegisterEventHandler,
+    SetEnvironmentVariable,
     TimerAction,
 )
 from launch.conditions import IfCondition
@@ -77,6 +81,23 @@ def generate_launch_description():
 
     gazebo_share = get_package_share_directory('gazebo_ros')
     default_world = os.path.join(gazebo_share, 'worlds', 'empty.world')
+
+    # gzserver resolves a URDF <plugin filename="libgazebo_grasp_attach.so"/>
+    # on GAZEBO_PLUGIN_PATH. The grasp weld plugin lives in
+    # my_robot_grasp_attach; without its lib directory gzserver silently skips
+    # the plugin and the cube would never leave the pedestal.
+    attach_lib_dir = os.path.join(
+        get_package_prefix('my_robot_grasp_attach'), 'lib')
+    if not os.path.isdir(attach_lib_dir):
+        raise RuntimeError(
+            'my_robot_grasp_attach is installed but %s does not exist; '
+            'rebuild it with colcon build --packages-select '
+            'my_robot_grasp_attach' % attach_lib_dir)
+    gazebo_plugin_path = attach_lib_dir
+    if os.environ.get('GAZEBO_PLUGIN_PATH'):
+        gazebo_plugin_path += os.pathsep + os.environ['GAZEBO_PLUGIN_PATH']
+    set_gazebo_plugin_path = SetEnvironmentVariable(
+        'GAZEBO_PLUGIN_PATH', gazebo_plugin_path)
 
     # Same gzserver/gzclient split as sim.launch.py so the custom world is
     # actually forwarded (gazebo.launch.py drops the world argument).
@@ -242,6 +263,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'verbose', default_value='false',
             description='Run gzserver with verbose output'),
+        set_gazebo_plugin_path,
         gzserver,
         gzclient,
         robot_state_publisher,

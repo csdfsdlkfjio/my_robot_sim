@@ -1,21 +1,62 @@
 """Unit tests for the mobile-manipulation state machine helpers."""
 
 import math
+import os
 
+import pytest
 from geometry_msgs.msg import Quaternion, Twist
+from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
 from moveit_msgs.msg import MoveItErrorCodes
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 
+from my_robot_sim.grasp_box import load_config
 from my_robot_sim.mobile_manipulation_node import (
-    ARM_BASE_FRAME, ARM_GROUP, ARM_JOINTS, ARM_TRAJECTORY_ACTION,
-    DRIVE_DISTANCE, END_EFFECTOR_LINK, FORWARD_SPEED, GRIPPER_CLOSED,
-    GRIPPER_DOWN, GRIPPER_OPEN, HAND_GROUP, HAND_JOINTS, HOME_DURATION,
-    HOME_JOINTS, MobileManipulationNode, TARGET_POSITION,
-    has_all_joints, make_forward_twist, make_gripper_goal,
-    make_home_trajectory, make_reach_goal, make_stop_twist,
-    odom_distance, odom_xy,
+    ARM_BASE_FRAME,
+    ARM_GROUP,
+    ARM_JOINTS,
+    ARM_MOUNT_OFFSET,
+    ARM_TRAJECTORY_ACTION,
+    BOX_OBJECT_ID,
+    DRIVE_DISTANCE,
+    END_EFFECTOR_LINK,
+    FORWARD_SPEED,
+    GAZEBO_HAND_LINK,
+    GRIPPER_DOWN,
+    GRIPPER_OPEN,
+    GROUND_TRUTH_TOPIC,
+    HAND_GROUP,
+    HAND_JOINTS,
+    HOME_DURATION,
+    HOME_JOINTS,
+    MobileManipulationNode,
+    ODOM_FRAME,
+    TOUCH_LINKS,
+    default_grasp_config_path,
+    finger_gap,
+    has_all_joints,
+    inverse_quaternion,
+    make_attach_command,
+    make_attached_object,
+    make_box_object,
+    make_cartesian_request,
+    make_effort_command,
+    make_forward_twist,
+    make_gripper_goal,
+    make_home_trajectory,
+    make_pose,
+    make_reach_goal,
+    make_removed_object,
+    make_stop_twist,
+    make_switch_request,
+    odom_distance,
+    odom_xy,
+    pads_hold_a_cube,
+    pre_close_position,
+    quaternion_multiply,
+    rotate_vector,
+    tcp_hand_position,
 )
 
 
@@ -27,11 +68,11 @@ def test_arm_and_hand_joint_sets_are_complete_and_disjoint():
     assert len(HOME_JOINTS) == 7
 
 
-def test_target_and_drive_distance_match_the_request():
-    """The delivered flow is: drive 1 m, reach (0.5, 0, 0.3), close."""
+def test_drive_parameters_match_the_request():
+    """The delivered flow drives 1 m and then picks up the cube."""
     assert DRIVE_DISTANCE == 1.0
-    assert TARGET_POSITION == (0.5, 0.0, 0.3)
     assert FORWARD_SPEED > 0.0
+    assert GRIPPER_OPEN == 0.04
 
 
 def test_gripper_orientation_is_unit_quaternion_pointing_down():
@@ -44,6 +85,42 @@ def test_gripper_orientation_is_unit_quaternion_pointing_down():
         1.0 - 2.0 * (x * x + y * y),
     )
     assert local_z_in_base[2] == -1.0
+
+
+def test_tcp_hand_position_puts_the_hand_above_the_grasp_point():
+    """With the gripper down the hand origin is tcp_offset above the box."""
+    box = (0.49, 0.0, 0.25)
+    assert tcp_hand_position(box, 0.10) == pytest.approx(
+        (0.49, 0.0, 0.35))
+    assert tcp_hand_position(box, 0.10, 0.075) == pytest.approx(
+        (0.49, 0.0, 0.425))
+
+
+def test_pre_close_position_leaves_the_pads_just_outside_the_cube():
+    """The gap is twice the joint value; the pads stop 5 mm from the faces."""
+    assert pre_close_position(0.05) == pytest.approx(0.030)
+    assert 2.0 * pre_close_position(0.05) > 0.05
+    assert pre_close_position(0.05) < 0.04
+
+
+def test_effort_command_presses_both_fingers_inward():
+    """Both finger axes point outward, so a negative effort closes them."""
+    message = make_effort_command(2.0)
+    assert message.data == pytest.approx([-2.0, -2.0])
+    # The sign is forced even if a positive magnitude is passed.
+    assert make_effort_command(-2.0).data == pytest.approx([-2.0, -2.0])
+
+
+def test_switch_request_strictly_swaps_the_hand_controllers():
+    """The swap must be strict so the squeeze never runs on a stale owner."""
+    request = make_switch_request(
+        activate=['panda_hand_effort_controller'],
+        deactivate=['panda_hand_controller'])
+    assert list(request.activate_controllers) == [
+        'panda_hand_effort_controller']
+    assert list(request.deactivate_controllers) == ['panda_hand_controller']
+    assert request.strictness == request.STRICT
+    assert request.timeout.sec == 5
 
 
 def test_odom_distance_uses_planar_euclidean_distance():
@@ -78,7 +155,7 @@ def test_make_forward_and_stop_twists():
 
 def test_reach_goal_targets_hand_pose_in_arm_base_frame():
     """The goal must be a position + orientation constraint for panda_hand."""
-    goal = make_reach_goal()
+    goal = make_reach_goal((0.485, 0.0, 0.115))
     assert goal.request.group_name == ARM_GROUP == 'panda_arm'
     assert goal.planning_options.plan_only is False
     assert len(goal.request.goal_constraints) == 1
@@ -88,7 +165,7 @@ def test_reach_goal_targets_hand_pose_in_arm_base_frame():
     assert position.header.frame_id == ARM_BASE_FRAME == 'panda_link0'
     assert position.link_name == END_EFFECTOR_LINK == 'panda_hand'
     target = position.constraint_region.primitive_poses[0].position
-    assert (target.x, target.y, target.z) == TARGET_POSITION
+    assert (target.x, target.y, target.z) == (0.485, 0.0, 0.115)
     assert position.constraint_region.primitives[0].type == \
         SolidPrimitive.SPHERE
 
@@ -99,6 +176,138 @@ def test_reach_goal_targets_hand_pose_in_arm_base_frame():
     assert (orientation.orientation.x, orientation.orientation.y,
             orientation.orientation.z, orientation.orientation.w) == \
         GRIPPER_DOWN
+
+
+def test_make_pose_uses_the_gripper_down_orientation():
+    """The Cartesian descend and lift need a fully specified hand pose."""
+    pose = make_pose((0.438, -0.007, 0.115))
+    assert (pose.position.x, pose.position.y, pose.position.z) == \
+        (0.438, -0.007, 0.115)
+    orientation = pose.orientation
+    assert (orientation.x, orientation.y, orientation.z, orientation.w) == \
+        GRIPPER_DOWN
+
+
+def test_quaternion_multiply_composes_yaw_with_gripper_down():
+    """A base yaw must rotate the gripper target but keep it pointing down."""
+    half = math.sqrt(0.5)
+    yaw_90 = (0.0, 0.0, half, half)
+    identity = (0.0, 0.0, 0.0, 1.0)
+    assert quaternion_multiply(identity, GRIPPER_DOWN) == \
+        pytest.approx(GRIPPER_DOWN)
+    combined = quaternion_multiply(yaw_90, GRIPPER_DOWN)
+    assert combined == pytest.approx((half, half, 0.0, 0.0))
+    # The hand z axis still points at the floor; the hand x axis now points
+    # along world +y as well, i.e. the pads are parallel to an x/y-aligned box.
+    x, y, z, w = combined
+    for vector, expected in (
+            ((0.0, 0.0, 1.0), (0.0, 0.0, -1.0)),
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))):
+        vx, vy, vz = vector
+        # v' = q * v * q^-1, expanded without a tf dependency.
+        tx = 2.0 * (y * vz - z * vy)
+        ty = 2.0 * (z * vx - x * vz)
+        tz = 2.0 * (x * vy - y * vx)
+        rotated = (
+            vx + w * tx + (y * tz - z * ty),
+            vy + w * ty + (z * tx - x * tz),
+            vz + w * tz + (x * ty - y * tx),
+        )
+        assert rotated == pytest.approx(expected, abs=1e-9)
+
+
+def test_rotate_vector_inverts_with_the_conjugate():
+    """The ground-truth point transform relies on these two primitives."""
+    half = math.sqrt(0.5)
+    yaw_90 = (0.0, 0.0, half, half)
+    assert rotate_vector(yaw_90, (1.0, 0.0, 0.0)) == pytest.approx(
+        (0.0, 1.0, 0.0), abs=1e-9)
+    assert inverse_quaternion(yaw_90) == pytest.approx((0.0, 0.0, -half, half))
+    vector = (0.3, -0.2, 0.7)
+    assert rotate_vector(inverse_quaternion(yaw_90),
+                         rotate_vector(yaw_90, vector)) == \
+        pytest.approx(vector, abs=1e-9)
+
+
+def make_ground_truth(base_xyz, yaw):
+    """One Odometry message as libgazebo_ros_p3d publishes it."""
+    message = Odometry()
+    message.pose.pose.position.x = base_xyz[0]
+    message.pose.pose.position.y = base_xyz[1]
+    message.pose.pose.position.z = base_xyz[2]
+    message.pose.pose.orientation.z = math.sin(yaw / 2.0)
+    message.pose.pose.orientation.w = math.cos(yaw / 2.0)
+    return message
+
+
+def test_ground_truth_base_pose_gives_the_arm_frame_geometry():
+    """Slip-free geometry: panda_link0 = base_link - (0.04, 0, -0.035)."""
+    import rclpy
+    rclpy.init()
+    node = MobileManipulationNode()
+    try:
+        yaw = math.pi / 2.0
+        node.ground_truth = make_ground_truth((1.0, 0.0, 0.2), yaw)
+        # The cube is 0.5 m along world +y, which is straight ahead of the
+        # 90-degree-yawed base, 5 cm above the base origin.
+        point = node.point_in_arm_frame((1.0, 0.5, 0.25))
+        assert (point.x, point.y, point.z) == pytest.approx(
+            (0.5 - ARM_MOUNT_OFFSET[0],
+             0.0 - ARM_MOUNT_OFFSET[1],
+             0.05 - ARM_MOUNT_OFFSET[2]))
+
+        orientation = node.orientation_in_arm_frame()
+        expected = quaternion_multiply(
+            inverse_quaternion(
+                (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))),
+            GRIPPER_DOWN)
+        assert orientation == pytest.approx(expected)
+        # The corrected orientation still points the hand at the floor.
+        assert rotate_vector(orientation, (0.0, 0.0, 1.0)) == pytest.approx(
+            (0.0, 0.0, -1.0), abs=1e-9)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_reach_goal_uses_the_base_yaw_corrected_orientation():
+    """The pad alignment correction must reach both MoveIt and the poses."""
+    half = math.sqrt(0.5)
+    corrected = quaternion_multiply((0.0, 0.0, half, half), GRIPPER_DOWN)
+    goal = make_reach_goal((0.485, 0.0, 0.115), corrected)
+    orientation = goal.request.goal_constraints[0].orientation_constraints[0]
+    assert (orientation.orientation.x, orientation.orientation.y,
+            orientation.orientation.z, orientation.orientation.w) == \
+        pytest.approx(corrected)
+
+    pose = make_pose((0.438, -0.007, 0.115), corrected)
+    assert (pose.orientation.x, pose.orientation.y,
+            pose.orientation.z, pose.orientation.w) == \
+        pytest.approx(corrected)
+
+
+def test_cartesian_request_plans_a_straight_line_for_the_hand():
+    """A free-space RRT path can clip the cube; the descend must be straight."""
+    waypoint = make_pose((0.438, -0.007, 0.115))
+    request = make_cartesian_request([waypoint])
+    assert request.header.frame_id == ARM_BASE_FRAME
+    assert request.group_name == ARM_GROUP
+    assert request.link_name == END_EFFECTOR_LINK
+    assert request.avoid_collisions is True
+    assert request.max_step > 0.0
+    assert request.jump_threshold == 0.0
+    assert len(request.waypoints) == 1
+    assert request.waypoints[0].position.z == 0.115
+    assert request.max_velocity_scaling_factor == pytest.approx(0.3)
+    # An empty start state makes MoveIt start from the current state.
+    assert list(request.start_state.joint_state.name) == []
+
+
+def test_cartesian_request_can_slow_the_lift_down():
+    """A slow lift keeps the pads from slipping off the squeezed cube."""
+    waypoint = make_pose((0.438, -0.007, 0.215))
+    request = make_cartesian_request([waypoint], velocity=0.1)
+    assert request.max_velocity_scaling_factor == pytest.approx(0.1)
 
 
 def test_home_trajectory_commands_all_seven_joints():
@@ -115,22 +324,108 @@ def test_home_trajectory_commands_all_seven_joints():
 
 
 def test_gripper_goal_commands_both_fingers_symmetrically():
-    """Both finger joints get the same closing position."""
-    goal = make_gripper_goal()
+    """Both finger joints get the same position."""
+    goal = make_gripper_goal(0.023)
     assert goal.request.group_name == HAND_GROUP == 'hand'
     constraints = goal.request.goal_constraints[0]
     assert [c.joint_name for c in constraints.joint_constraints] == \
         list(HAND_JOINTS)
     assert [c.position for c in constraints.joint_constraints] == \
-        [GRIPPER_CLOSED, GRIPPER_CLOSED]
-    assert 0.0 <= GRIPPER_CLOSED <= 0.04
+        [0.023, 0.023]
+    assert 0.0 <= 0.023 <= 0.04
 
     opened = make_gripper_goal(GRIPPER_OPEN)
     positions = [
         c.position
         for c in opened.request.goal_constraints[0].joint_constraints]
     assert positions == [GRIPPER_OPEN, GRIPPER_OPEN]
-    assert GRIPPER_OPEN == 0.04
+
+
+def test_finger_gap_adds_both_pad_displacements():
+    """The pads' inner faces are the sum of the two finger joints apart."""
+    assert finger_gap((0.025, 0.025)) == pytest.approx(0.05)
+    assert finger_gap((0.0331, 0.0151)) == pytest.approx(0.0482)
+
+
+def test_symmetric_squeeze_holds_the_cube():
+    """A cube centred between the pads leaves both fingers at size / 2."""
+    assert pads_hold_a_cube((0.025, 0.025), 0.05)
+
+
+def test_off_centre_cube_still_counts_as_gripped():
+    """
+    Measured in Gazebo: one finger contacts first and pushes the cube aside.
+
+    (0.0331, 0.0151) is a real squeeze from the 4 N run; the gap still equals
+    the cube width, so the pads straddle the cube.
+    """
+    assert pads_hold_a_cube((0.0331, 0.0151), 0.05)
+
+
+def test_fully_closed_fingers_mean_the_cube_was_missed():
+    """Without the cube between them, the fingers close all the way."""
+    assert not pads_hold_a_cube((0.0, 0.0), 0.05)
+    assert not pads_hold_a_cube((0.002, 0.001), 0.05)
+
+
+def test_pads_that_never_reach_the_cube_do_not_count():
+    """An open gripper (or a cube far wider than the pads) is not a grasp."""
+    assert not pads_hold_a_cube((0.04, 0.04), 0.05)
+
+
+def test_box_object_is_a_primitive_at_the_given_pose():
+    """The cube must appear in RViz as a box at the measured box pose."""
+    message = make_box_object((0.49, 0.0, 0.25), (0.05, 0.05, 0.05))
+    assert isinstance(message, CollisionObject)
+    assert message.id == BOX_OBJECT_ID == 'grasp_box'
+    assert message.header.frame_id == ARM_BASE_FRAME
+    assert message.operation == CollisionObject.ADD
+    assert len(message.primitives) == 1
+    assert message.primitives[0].type == SolidPrimitive.BOX
+    assert list(message.primitives[0].dimensions) == [0.05, 0.05, 0.05]
+    pose = message.primitive_poses[0]
+    assert (pose.position.x, pose.position.y, pose.position.z) == \
+        (0.49, 0.0, 0.25)
+    assert pose.orientation.w == 1.0
+
+
+def test_removed_object_only_carries_the_id_and_operation():
+    """Removing the cube before closing the fingers needs no geometry."""
+    message = make_removed_object(BOX_OBJECT_ID)
+    assert message.id == BOX_OBJECT_ID
+    assert message.operation == CollisionObject.REMOVE
+    assert message.header.frame_id == ARM_BASE_FRAME
+
+
+def test_attached_object_hangs_the_cube_on_the_hand():
+    """The attached object is what makes MoveIt and RViz carry the cube."""
+    box = make_box_object((0.49, 0.0, 0.25), (0.05, 0.05, 0.05))
+    attached = make_attached_object(box)
+    assert isinstance(attached, AttachedCollisionObject)
+    assert attached.link_name == END_EFFECTOR_LINK == 'panda_hand'
+    assert attached.object.id == BOX_OBJECT_ID
+    assert set(attached.touch_links) == set(TOUCH_LINKS)
+    assert 'panda_hand' in attached.touch_links
+    assert 'panda_leftfinger' in attached.touch_links
+    assert 'panda_rightfinger' in attached.touch_links
+
+
+def test_attach_command_names_the_hand_and_the_gazebo_cube():
+    """
+    The Gazebo plugin welds grasp_box::link to the real hand link.
+
+    Gazebo's URDF->SDF conversion lumps panda_hand into panda_link7, so a
+    command naming panda_hand is rejected by the plugin.
+    """
+    assert GAZEBO_HAND_LINK == 'panda_link7'
+    assert make_attach_command() == \
+        'attach mobile_manipulator panda_link7 grasp_box link'
+
+
+def test_attach_command_accepts_explicit_entities():
+    """The command format is 'attach <parent> <link> <child> <link>'."""
+    assert make_attach_command(
+        'robot', 'tool', 'cube', 'body') == 'attach robot tool cube body'
 
 
 def test_has_all_joints_requires_every_arm_joint():
@@ -148,8 +443,14 @@ def test_success_code_is_moveit_success():
     assert MoveItErrorCodes.SUCCESS == 1
 
 
-def test_node_declares_tunable_parameters():
-    """The node exposes distance / speed / target overrides."""
+def test_default_grasp_config_is_the_installed_file():
+    path = default_grasp_config_path()
+    assert os.path.isfile(path)
+    assert path.endswith(os.path.join('config', 'grasp_box.yaml'))
+
+
+def test_node_loads_the_grasp_config_and_exposes_parameters():
+    """The node must read the same file the launch spawns the box from."""
     import rclpy
     rclpy.init()
     node = MobileManipulationNode()
@@ -159,9 +460,26 @@ def test_node_declares_tunable_parameters():
         assert callable(node.drive_forward)
         assert not callable(node.drive_distance)
         assert node.forward_speed == FORWARD_SPEED
-        assert node.target_position == TARGET_POSITION
         assert node.home_first is True
+        assert node.grasp_config_path == default_grasp_config_path()
+        assert node.grasp == load_config(default_grasp_config_path())
+        assert node.grasp['size'] == 0.05
+        assert ODOM_FRAME == 'odom'
+        # move_group's scene monitor listens on these two topics; the
+        # /apply_planning_scene service cannot carry attached objects.
+        assert node.collision_object_pub.topic_name == '/collision_object'
+        assert node.attached_pub.topic_name == '/attached_collision_object'
+        assert node.hand_effort_pub.topic_name == \
+            '/panda_hand_effort_controller/commands'
+        assert node.switch_client.srv_name == \
+            '/controller_manager/switch_controller'
+        assert node.grasp['squeeze_effort'] > 0.0
         assert isinstance(make_stop_twist(), Twist)
+        # Without the plugin the node must fall back to the odom TF.
+        assert node.ground_truth is None
+        assert any(
+            subscription.topic_name == GROUND_TRUTH_TOPIC
+            for subscription in node.subscriptions)
     finally:
         node.destroy_node()
         rclpy.shutdown()
