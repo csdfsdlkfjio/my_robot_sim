@@ -181,11 +181,14 @@ def test_wrist_camera_is_mounted_on_the_hand(robot):
 
 def test_camera_sensor_reaches_the_gazebo_model(urdf_text):
     """
-    The sensor must survive the URDF->SDF conversion with its plugin intact.
+    The depth sensor must survive the URDF->SDF conversion intact.
 
-    The camera link is fixed to panda_hand, which Gazebo already lumps into
-    panda_link7; the converter moves the sensor along with the lumped visual,
-    and drops it entirely if the <gazebo reference> block is malformed.
+    Humble's libgazebo_ros_camera.so serves both RGB and depth from a
+    ``depth`` sensor: it publishes /camera/image_raw and
+    /camera/depth/image_raw through the same plugin. The camera link is fixed
+    to panda_hand, which Gazebo already lumps into panda_link7; the converter
+    moves the sensor along with the lumped visual, and drops it entirely if
+    the <gazebo reference> block is malformed.
     """
     with tempfile.NamedTemporaryFile(
             'w', suffix='.urdf', delete=False) as handle:
@@ -203,7 +206,7 @@ def test_camera_sensor_reaches_the_gazebo_model(urdf_text):
                if sensor.get('name') == 'arm_camera']
     assert len(sensors) == 1
     sensor = sensors[0]
-    assert sensor.get('type') == 'camera'
+    assert sensor.get('type') == 'depth'
     assert float(sensor.findtext('update_rate')) == pytest.approx(30.0)
     image = sensor.find('camera/image')
     assert int(image.findtext('width')) == 640
@@ -211,11 +214,16 @@ def test_camera_sensor_reaches_the_gazebo_model(urdf_text):
     assert image.findtext('format').strip() == 'R8G8B8'
     plugin = sensor.find('plugin')
     assert plugin.get('filename') == 'libgazebo_ros_camera.so'
-    # camera_name prefixes the topics: /camera/image_raw and
-    # /camera/camera_info. frame_name must match the optical frame that
-    # robot_state_publisher publishes, or the image TF is disconnected.
+    # camera_name prefixes the topics: /camera/image_raw,
+    # /camera/camera_info, /camera/depth/image_raw and /camera/points.
+    # frame_name must match the optical frame that robot_state_publisher
+    # publishes, or the image TF is disconnected.
     assert plugin.findtext('camera_name').strip() == 'camera'
     assert plugin.findtext('frame_name').strip() == 'camera_optical_link'
+    # Depth outside this range becomes an invalid measurement, so the grasp
+    # node never back-projects a point behind the camera or across the room.
+    assert float(plugin.findtext('min_depth')) == pytest.approx(0.02)
+    assert float(plugin.findtext('max_depth')) == pytest.approx(10.0)
 
 
 def test_ros2_control_owns_only_the_arm(robot):

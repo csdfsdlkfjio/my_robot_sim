@@ -76,7 +76,7 @@
     <origin xyz="0 0 0.005"/>
   </joint>
 
-  <!-- ================= 5. 腕部 RGB 相机 ================= -->
+  <!-- ================= 5. 腕部 RGB-D 相机 ================= -->
   <!-- 相机装在手掌左侧，光轴沿手指方向（夹取时朝下），用来观察夹爪前方的
        物体。相机本体只有视觉和惯量：它没有碰撞体，因此不会伸进夹爪间隙或
        顶到箱子。
@@ -84,7 +84,12 @@
        绕 y 轴转 -90 度，让 +x 对齐手掌的 +z（手指方向）。光学坐标系按 ROS
        约定（z 向前、x 向右、y 向下）作为 camera_link 的固定子帧，图像的
        frame_id 用这个光学帧；这两个帧都由 robot_state_publisher 从 URDF
-       自动发布到 /tf。 -->
+       自动发布到 /tf。
+       Humble 没有单独的 gazebo_ros_depth_camera 插件；libgazebo_ros_camera.so
+       同时支持 sensor type="camera" 和 "depth"。这里用 depth 传感器，所以
+       同一个插件会额外发布 /camera/depth/image_raw（32FC1，单位米）、
+       /camera/depth/camera_info 和 /camera/points。RGB 话题仍然是
+       /camera/image_raw 和 /camera/camera_info。 -->
   <link name="camera_link">
     <visual>
       <geometry><box size="0.02 0.05 0.03"/></geometry>
@@ -110,7 +115,7 @@
 
   <gazebo reference="camera_link">
     <material>Gazebo/DarkGrey</material>
-    <sensor name="arm_camera" type="camera">
+    <sensor name="arm_camera" type="depth">
       <always_on>true</always_on>
       <update_rate>30</update_rate>
       <camera>
@@ -125,12 +130,15 @@
           <far>10.0</far>
         </clip>
       </camera>
-      <!-- camera_name 是话题前缀：在根命名空间下得到 /camera/image_raw 和
-           /camera/camera_info。frame_name 与 URDF 里的光学帧一致，TF 由
-           robot_state_publisher 提供。 -->
+      <!-- camera_name 是话题前缀：在根命名空间下得到 /camera/image_raw、
+           /camera/camera_info、/camera/depth/image_raw 和 /camera/points。
+           frame_name 与 URDF 里的光学帧一致，TF 由 robot_state_publisher
+           提供。min_depth/max_depth 之外的深度值会被插件置为无效点。 -->
       <plugin name="arm_camera_controller" filename="libgazebo_ros_camera.so">
         <camera_name>camera</camera_name>
         <frame_name>camera_optical_link</frame_name>
+        <min_depth>0.02</min_depth>
+        <max_depth>10.0</max_depth>
       </plugin>
     </sensor>
   </gazebo>
