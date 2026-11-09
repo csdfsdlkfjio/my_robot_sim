@@ -40,6 +40,7 @@ setup(
         'console_scripts': [
             'mobile_manipulation_node = '
             'my_robot_sim.mobile_manipulation_node:main',
+            'visual_grasp = my_robot_sim.visual_grasp:main',
         ],
     },
 )

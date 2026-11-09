@@ -529,8 +529,8 @@ def odom_xy(odometry):
 class MobileManipulationNode(Node):
     """Run the drive -> approach -> grasp -> lift sequence."""
 
-    def __init__(self):
-        super().__init__('mobile_manipulation_node')
+    def __init__(self, node_name='mobile_manipulation_node'):
+        super().__init__(node_name)
         self.drive_distance = float(
             self.declare_parameter('drive_distance', DRIVE_DISTANCE).value)
         self.forward_speed = float(
