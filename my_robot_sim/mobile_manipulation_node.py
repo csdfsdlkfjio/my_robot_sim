@@ -148,7 +148,12 @@ HAND_EFFORT_CONTROLLER = 'panda_hand_effort_controller'
 HAND_EFFORT_TOPIC = '/panda_hand_effort_controller/commands'
 SWITCH_CONTROLLER_SERVICE = '/controller_manager/switch_controller'
 PRE_CLOSE_CLEARANCE = 0.005  # m between pad and cube before the force press
-SQUEEZE_SETTLE_SECONDS = 0.8
+# How long to keep pressing with the effort controller. The fingers can take
+# longer than the old fixed 0.8 s when the cube sits slightly off-centre:
+# one pad reaches it first and pushes it towards the other. Polling the joint
+# states until the gap matches is both faster when it seats early and safe
+# when it needs more time.
+SQUEEZE_TIMEOUT = 5.0  # s
 SQUEEZE_CONTACT_TOLERANCE = 0.003  # m; pads must rest on the cube faces
 
 DRIVE_DISTANCE = 1.0
@@ -916,25 +921,27 @@ class MobileManipulationNode(Node):
             return False
 
         command = make_effort_command(effort)
-        deadline = time.monotonic() + SQUEEZE_SETTLE_SECONDS
+        deadline = time.monotonic() + SQUEEZE_TIMEOUT
+        positions = None
         while rclpy.ok() and time.monotonic() < deadline:
             self.hand_effort_pub.publish(command)
             rclpy.spin_once(self, timeout_sec=0.02)
+            positions = self.finger_positions()
+            if positions is not None and pads_hold_a_cube(positions, size):
+                self.get_logger().info(
+                    '夹爪已用 %.1f N 的力夹住箱子，关节位置 (%0.4f, %0.4f) m。'
+                    % (effort, positions[0], positions[1]))
+                return True
 
-        positions = self.finger_positions()
         if positions is None:
             self.get_logger().error('没有收到夹爪关节状态')
             return False
-        if not pads_hold_a_cube(positions, size):
-            self.get_logger().error(
-                '夹爪没有夹住箱子：关节位置 (%0.4f, %0.4f) m，两指间距 '
-                '%0.4f m，箱子宽 %0.3f m'
-                % (positions[0], positions[1], finger_gap(positions), size))
-            return False
-        self.get_logger().info(
-            '夹爪已用 %.1f N 的力夹住箱子，关节位置 (%0.4f, %0.4f) m。'
-            % (effort, positions[0], positions[1]))
-        return True
+        self.get_logger().error(
+            '%.1f s 内夹爪没有夹住箱子：关节位置 (%0.4f, %0.4f) m，'
+            '两指间距 %0.4f m，箱子宽 %0.3f m'
+            % (SQUEEZE_TIMEOUT, positions[0], positions[1],
+               finger_gap(positions), size))
+        return False
 
     def drive_forward(self, distance=None):
         """Drive straight until /odom reports ``distance`` metres travelled."""
