@@ -32,7 +32,10 @@ from my_robot_sim.mobile_manipulation_node import (
     HOME_JOINTS,
     MobileManipulationNode,
     ODOM_FRAME,
+    PRE_CLOSE_CLEARANCE,
+    PRE_CLOSE_MARGIN,
     TOUCH_LINKS,
+    cube_diagonal,
     default_grasp_config_path,
     finger_gap,
     has_all_joints,
@@ -45,17 +48,23 @@ from my_robot_sim.mobile_manipulation_node import (
     make_forward_twist,
     make_gripper_goal,
     make_home_trajectory,
+    make_open_effort_command,
     make_pose,
     make_reach_goal,
     make_removed_object,
     make_stop_twist,
     make_switch_request,
+    move_should_retry,
     odom_distance,
     odom_xy,
     pads_hold_a_cube,
+    point_in_arm,
+    point_in_world,
     pre_close_position,
+    pre_close_position_for,
     quaternion_multiply,
     rotate_vector,
+    squeeze_outcome,
     tcp_hand_position,
 )
 
@@ -96,11 +105,62 @@ def test_tcp_hand_position_puts_the_hand_above_the_grasp_point():
         (0.49, 0.0, 0.425))
 
 
-def test_pre_close_position_leaves_the_pads_just_outside_the_cube():
-    """The gap is twice the joint value; the pads stop 5 mm from the faces."""
-    assert pre_close_position(0.05) == pytest.approx(0.030)
-    assert 2.0 * pre_close_position(0.05) > 0.05
+def test_pre_close_position_leaves_the_pads_outside_the_cube():
+    """The gap is twice the joint value; each pad clears a face by 12 mm."""
+    assert pre_close_position(0.05) == pytest.approx(0.037)
+    assert 2.0 * pre_close_position(0.05) - 0.05 == pytest.approx(
+        2.0 * PRE_CLOSE_CLEARANCE)
     assert pre_close_position(0.05) < 0.04
+
+
+def test_pre_close_position_for_shortens_the_press_travel():
+    """With the cube measured 2 mm off centre, the near pad starts 4 mm out."""
+    value = pre_close_position_for(0.05, 0.002)
+    assert value == pytest.approx(0.025 + 0.002 + PRE_CLOSE_MARGIN)
+    # The near pad's distance to the near face is exactly the margin.
+    assert value - (0.025 + 0.002) == pytest.approx(PRE_CLOSE_MARGIN)
+    # The far pad is 2 * offset + margin away, still outside the cube.
+    assert value - (0.025 - 0.002) > PRE_CLOSE_MARGIN
+
+
+def test_pre_close_position_for_never_exceeds_the_open_limit():
+    """A large offset must not command a finger past its 0.04 m stop."""
+    assert pre_close_position_for(0.05, 0.0) == pytest.approx(
+        0.025 + PRE_CLOSE_MARGIN)
+    assert pre_close_position_for(0.05, -0.02) == pytest.approx(
+        0.025 + PRE_CLOSE_MARGIN)
+    assert pre_close_position_for(0.05, 0.02) == pytest.approx(0.04)
+
+
+def test_cube_diagonal_is_the_widest_span_of_the_cube():
+    """The measured 7.19 cm failure gap was the diagonal of a 5 cm cube."""
+    assert cube_diagonal(0.05) == pytest.approx(0.0707107, abs=1e-6)
+    assert cube_diagonal(0.05) > 0.05
+
+
+def test_squeeze_outcome_recognizes_the_face_grip():
+    """Pads on opposite faces leave the gap equal to the cube width."""
+    assert squeeze_outcome((0.025, 0.025), 0.05) == 'held'
+    assert squeeze_outcome((0.0331, 0.0151), 0.05) == 'held'
+
+
+def test_squeeze_outcome_recognizes_the_corner_grip():
+    """A cube turned 45 degrees is pinched across its diagonal."""
+    half_diagonal = cube_diagonal(0.05) / 2.0
+    assert squeeze_outcome((half_diagonal, half_diagonal), 0.05) == 'corners'
+    # The reported failure: (0.0358, 0.0361), gap 0.0719 m.
+    assert squeeze_outcome((0.0358, 0.0361), 0.05) == 'corners'
+
+
+def test_squeeze_outcome_recognizes_a_missed_cube():
+    """Without the cube between them, both fingers close to zero."""
+    assert squeeze_outcome((0.0, 0.0), 0.05) == 'missed'
+    assert squeeze_outcome((0.002, 0.001), 0.05) == 'missed'
+
+
+def test_squeeze_outcome_reports_an_unknown_blockage():
+    """A gap that is neither the width nor the diagonal is still useful."""
+    assert squeeze_outcome((0.018, 0.017), 0.05) == 'blocked'
 
 
 def test_effort_command_presses_both_fingers_inward():
@@ -109,6 +169,13 @@ def test_effort_command_presses_both_fingers_inward():
     assert message.data == pytest.approx([-2.0, -2.0])
     # The sign is forced even if a positive magnitude is passed.
     assert make_effort_command(-2.0).data == pytest.approx([-2.0, -2.0])
+
+
+def test_open_effort_command_pushes_both_fingers_outward():
+    """A positive effort drives both fingers against their open stops."""
+    message = make_open_effort_command(10.0)
+    assert message.data == pytest.approx([10.0, 10.0])
+    assert make_open_effort_command(-10.0).data == pytest.approx([10.0, 10.0])
 
 
 def test_switch_request_strictly_swaps_the_hand_controllers():
@@ -268,6 +335,35 @@ def test_ground_truth_base_pose_gives_the_arm_frame_geometry():
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
+
+def test_world_and_arm_points_are_inverse_with_the_mount_offset():
+    """A panda_link0 point and its world point must round-trip exactly."""
+    base = make_ground_truth((1.0, 0.5, 0.2), math.pi / 2.0).pose.pose
+    local = (0.5, 0.0, 0.05)
+    world = point_in_world(local, base)
+    # (0.5 - 0.04, 0, 0.05 + 0.035) rotated 90 degrees, then translated.
+    assert world == pytest.approx((1.0, 0.96, 0.285), abs=1e-9)
+    assert point_in_arm(world, base) == pytest.approx(local, abs=1e-9)
+
+
+def test_world_measurement_survives_a_base_slide():
+    """A world-fixed cube moves in panda_link0 when the chassis creeps."""
+    cube_world = (1.45, 0.0, 0.275)
+    before = make_ground_truth((1.0, 0.0, 0.2), 0.0).pose.pose
+    after = make_ground_truth((0.9, 0.0, 0.2), 0.0).pose.pose
+    assert point_in_arm(cube_world, before) == pytest.approx(
+        (0.49, 0.0, 0.04))
+    assert point_in_arm(cube_world, after) == pytest.approx(
+        (0.59, 0.0, 0.04))
+
+
+def test_only_planning_errors_are_retried():
+    """A collision-free replan is worthwhile; a control failure is not."""
+    assert move_should_retry(MoveItErrorCodes.PLANNING_FAILED)
+    assert move_should_retry(MoveItErrorCodes.INVALID_MOTION_PLAN)
+    assert not move_should_retry(MoveItErrorCodes.SUCCESS)
+    assert not move_should_retry(MoveItErrorCodes.CONTROL_FAILED)
 
 
 def test_reach_goal_uses_the_base_yaw_corrected_orientation():

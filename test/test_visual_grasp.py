@@ -17,13 +17,18 @@ from my_robot_sim.visual_grasp import (
     depth_image,
     detect_red_blob,
     hand_position_for_surface,
+    highest_face_center,
     lifted_position,
+    masked_camera_points,
     pixel_ray,
     point_on_plane,
+    quaternion_matrix,
     red_mask,
     scale_pixel,
+    source_name,
     transform_direction,
     transform_point,
+    transform_points,
 )
 
 
@@ -232,6 +237,88 @@ def test_transform_direction_does_not_translate():
      transform.transform.rotation.w) = quaternion_yaw(math.pi / 2.0)
     direction = transform_direction(transform, (1.0, 0.0, 0.0))
     assert direction == pytest.approx((0.0, 1.0, 0.0), abs=1e-9)
+
+
+def test_quaternion_matrix_rotates_about_z():
+    """A 90 degree yaw maps the camera x axis to the arm y axis."""
+    matrix = quaternion_matrix(quaternion_yaw(math.pi / 2.0))
+    rotated = matrix @ np.array([1.0, 0.0, 0.0])
+    assert rotated == pytest.approx([0.0, 1.0, 0.0], abs=1e-9)
+    assert quaternion_matrix((0.0, 0.0, 0.0, 0.0)) == pytest.approx(
+        np.eye(3))
+
+
+def test_transform_points_matches_the_single_point_transform():
+    """The array version must apply the same rotation and translation."""
+    transform = TransformStamped()
+    transform.transform.translation.x = 1.0
+    transform.transform.translation.y = 2.0
+    transform.transform.translation.z = 3.0
+    (transform.transform.rotation.x,
+     transform.transform.rotation.y,
+     transform.transform.rotation.z,
+     transform.transform.rotation.w) = quaternion_yaw(math.pi / 2.0)
+    points = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    transformed = transform_points(transform, points)
+    assert transformed[0] == pytest.approx(
+        transform_point(transform, (1.0, 0.0, 0.0)), abs=1e-9)
+    assert transformed[1] == pytest.approx(
+        transform_point(transform, (0.0, 1.0, 0.0)), abs=1e-9)
+
+
+def test_masked_camera_points_backprojects_the_masked_pixels():
+    """Only masked pixels with a valid depth contribute camera points."""
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[1, 3] = 255
+    mask[2, 1] = 255
+    depth = np.zeros((4, 4), dtype=np.float32)
+    depth[1, 3] = 0.5
+    depth[2, 1] = 0.0  # invalid; must be dropped
+    points = masked_camera_points(
+        mask, depth, 100.0, 100.0, 2.0, 2.0, stride=1, min_points=1)
+    assert points is not None
+    assert points.shape == (1, 3)
+    # u=3, v=1 -> x=(3-2)*0.5/100, y=(1-2)*0.5/100, z=0.5
+    assert points[0] == pytest.approx((0.005, -0.005, 0.5), abs=1e-9)
+
+
+def test_masked_camera_points_reject_an_empty_mask():
+    """No masked depth means no measurement, not a made-up point."""
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    depth = np.full((4, 4), 0.5, dtype=np.float32)
+    assert masked_camera_points(
+        mask, depth, 100.0, 100.0, 2.0, 2.0, stride=1, min_points=1) is None
+
+
+def test_highest_face_center_ignores_the_side_faces():
+    """The top face is flat and highest; its centre is not pulled sideways."""
+    xs = np.linspace(0.420, 0.470, 21)
+    ys = np.linspace(-0.020, 0.030, 21)
+    top = np.array([[x, y, 0.040] for x in xs for y in ys])
+    # A thin sliver of the +y side face: its top rows reach the top height.
+    side = np.array([[x, 0.030, z] for x in xs for z in (0.036, 0.039)])
+    centre = highest_face_center(np.vstack([side, top]))
+    assert centre is not None
+    # The side face's top strip is inside the height band, so the mean z is
+    # a fraction of a millimetre below the plane; that is far below the
+    # 2.6 cm error of the old centroid-depth sample.
+    assert centre[2] == pytest.approx(0.040, abs=0.001)
+    assert centre[0] == pytest.approx(float(np.mean(xs)), abs=0.002)
+    assert centre[1] == pytest.approx(float(np.mean(ys)), abs=0.004)
+
+
+def test_highest_face_center_needs_enough_points():
+    """A handful of stray pixels must not become a grasp target."""
+    points = np.array([[0.0, 0.0, 0.04]] * 3)
+    assert highest_face_center(points, min_points=10) is None
+    assert highest_face_center(None) is None
+
+
+def test_source_name_labels_the_top_face_measurement():
+    """The logs must say which measurement produced the grasp point."""
+    assert source_name('top') == '顶面点云'
+    assert source_name('depth') == '深度图'
+    assert source_name('plane') == '已知高度平面'
 
 
 def test_hand_position_moves_from_the_visible_face_to_the_cube_centre():

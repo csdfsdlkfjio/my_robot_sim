@@ -35,12 +35,17 @@ grasp_box:
   # Closing the fingers is done with a constant force, not a position: a
   # position command is a teleport in gazebo_ros2_control and produces no
   # steady squeeze. The prismatic finger joints have 1 N of joint friction,
-  # so part of the command never reaches the cube. A large command is not
-  # better: at 8 N the light cube was squeezed out of the pinch while the
-  # fingers were still closing. 4 N seats the pads on the cube's faces without
-  # ejecting it. The lift itself is carried by the fixed joint that the
-  # my_robot_grasp_attach plugin creates in Gazebo.
-  squeeze_effort: 4.0       # [N] constant closing force per finger
+  # so part of the command never reaches the cube. The earlier 7.19 cm gap
+  # was not a force shortage: the position-controlled "open" had settled at
+  # 0.036 m instead of 0.04 m, and the vision's centroid-depth point sat on
+  # a side face, so a pad scraped the cube's top edge during the descend and
+  # pushed it ~2 cm sideways. The open is now verified with the effort
+  # controller, the top face is measured from the highest part of the depth
+  # cloud, and the pre-close leaves only a few millimetres of press travel.
+  # At that short travel 10 N seats the pads without ejecting the cube; the
+  # lift itself is carried by the fixed joint that the my_robot_grasp_attach
+  # plugin creates in Gazebo.
+  squeeze_effort: 10.0      # [N] constant closing force per finger
   lift_height: 0.10         # [m] how far the arm lifts after attaching
   # MoveIt velocity scaling for the lift. A slow lift keeps the cube from
   # swinging while the fixed joint takes up the load.

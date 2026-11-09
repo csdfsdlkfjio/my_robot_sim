@@ -138,6 +138,14 @@ GRIPPER_DOWN = (1.0, 0.0, 0.0, 0.0)
 
 # Panda finger travel is 0..0.04 m (0 = fingers together, gap = 2 * joint).
 GRIPPER_OPEN = 0.04
+# A position goal at the open limit can settle a few millimetres short; the
+# wrist camera's side-face bias then lets a descending pad scrape the cube's
+# top edge (measured live: the cube was dragged 1.6 cm sideways during the
+# descend). The effort controller drives both fingers against their
+# mechanical stops, so the open gap is verifiable before the arm moves down.
+GRIPPER_OPEN_EFFORT = 10.0  # N per finger
+GRIPPER_OPEN_TOLERANCE = 0.001  # m; both fingers must be this close to 0.04
+OPEN_TIMEOUT = 2.0  # s
 
 # The gripper is opened and pre-closed by the position JTC, then switched to
 # a dedicated effort controller for the squeeze. A position command is a
@@ -147,7 +155,19 @@ HAND_POSITION_CONTROLLER = 'panda_hand_controller'
 HAND_EFFORT_CONTROLLER = 'panda_hand_effort_controller'
 HAND_EFFORT_TOPIC = '/panda_hand_effort_controller/commands'
 SWITCH_CONTROLLER_SERVICE = '/controller_manager/switch_controller'
-PRE_CLOSE_CLEARANCE = 0.005  # m between pad and cube before the force press
+# Clearance between each pad and the cube for the base node's fixed pre-close,
+# and the largest lateral cube-to-hand offset the visual grasp will descend
+# with. If a pad does touch the cube's top edge on the way down, the contact
+# pushes the cube sideways and the force press can end up on its edges; the
+# measured failure left the fingers at 7.19 cm, near the cube's 7.07 cm face
+# diagonal. The visual grasp therefore measures the top face properly and
+# verifies the gripper is fully open before it descends.
+PRE_CLOSE_CLEARANCE = 0.012  # m between pad and cube before the force press
+# The force press starts from a position pre-close. Its travel is what turns
+# the finger's 10 N into an impact instead of a squeeze, so keep the pads a
+# few millimetres (not a full centimetre) outside the face that the measured
+# lateral offset says is nearest.
+PRE_CLOSE_MARGIN = 0.004  # m between the nearest pad and the cube face
 # How long to keep pressing with the effort controller. The fingers can take
 # longer than the old fixed 0.8 s when the cube sits slightly off-centre:
 # one pad reaches it first and pushes it towards the other. Polling the joint
@@ -164,6 +184,23 @@ DRIVE_TIMEOUT = 30.0
 MOVE_TIMEOUT = 90.0
 TF_TIMEOUT = 15.0
 SCENE_SETTLE_SECONDS = 0.5
+
+# MoveIt occasionally returns an invalid plan (-2) from the free-space
+# approach even though the pose is reachable: at the last validation step one
+# interpolated state is found in collision and the whole request fails. A
+# fresh planning attempt uses a new random seed and normally succeeds, so
+# retry the retryable planning errors instead of aborting the grasp.
+MOVE_ATTEMPTS = 3
+RETRYABLE_MOVE_ERRORS = (
+    MoveItErrorCodes.PLANNING_FAILED,
+    MoveItErrorCodes.INVALID_MOTION_PLAN,
+)
+
+
+def move_should_retry(error_code):
+    """Return True when a failed MoveGroup result is worth replanning."""
+    return error_code in RETRYABLE_MOVE_ERRORS
+
 
 POSITION_TOLERANCE = 0.01  # m
 ORIENTATION_TOLERANCE = 0.05  # rad, about 2.9 degrees
@@ -231,6 +268,23 @@ def pre_close_position(size, clearance=PRE_CLOSE_CLEARANCE):
     return float(size) / 2.0 + float(clearance)
 
 
+def pre_close_position_for(size, lateral, margin=PRE_CLOSE_MARGIN):
+    """
+    Finger value that leaves ``margin`` between the nearest pad and the cube.
+
+    ``lateral`` is how far the cube centre is from the hand centre along the
+    finger axis. With the cube pushed towards one pad by that much, the
+    nearest pad's distance to the cube face is
+    ``size / 2 + lateral - finger_value``; solving for the requested margin
+    gives the value below. The far pad is then ``2 * lateral`` further away,
+    so a small measured offset keeps both pads close to their faces and the
+    effort press has little room to accelerate.
+    """
+    offset = max(0.0, float(lateral))
+    value = float(size) / 2.0 + offset + float(margin)
+    return min(GRIPPER_OPEN, value)
+
+
 def finger_gap(positions):
     """
     Gap between the pads for the two finger joint values.
@@ -254,6 +308,32 @@ def pads_hold_a_cube(positions, size, tolerance=SQUEEZE_CONTACT_TOLERANCE):
     return abs(finger_gap(positions) - float(size)) <= 2.0 * tolerance
 
 
+def cube_diagonal(size):
+    """Widest planar span of the cube: the diagonal of a square face."""
+    return float(size) * math.sqrt(2.0)
+
+
+def squeeze_outcome(positions, size, tolerance=SQUEEZE_CONTACT_TOLERANCE):
+    """
+    Classify why the squeeze stopped where it did.
+
+    ``held`` means the pads rest on opposite faces. ``corners`` is the
+    measured failure mode of a rotated cube: both pads press opposite
+    vertical edges, so the gap is the face diagonal, sqrt(2) * size.
+    ``missed`` means the fingers closed completely without the cube between
+    them; ``blocked`` is anything else (the cube on the pedestal, an arm
+    link, or a stuck finger).
+    """
+    gap = finger_gap(positions)
+    if abs(gap - float(size)) <= 2.0 * tolerance:
+        return 'held'
+    if abs(gap - cube_diagonal(size)) <= 2.0 * tolerance:
+        return 'corners'
+    if gap <= float(size) / 2.0:
+        return 'missed'
+    return 'blocked'
+
+
 def make_effort_command(effort, joint_count=len(HAND_JOINTS)):
     """
     Build the constant-effort command that closes both fingers.
@@ -264,6 +344,13 @@ def make_effort_command(effort, joint_count=len(HAND_JOINTS)):
     """
     message = Float64MultiArray()
     message.data = [-abs(float(effort))] * joint_count
+    return message
+
+
+def make_open_effort_command(effort, joint_count=len(HAND_JOINTS)):
+    """Build the command that pushes both fingers against their open stops."""
+    message = Float64MultiArray()
+    message.data = [abs(float(effort))] * joint_count
     return message
 
 
@@ -322,6 +409,48 @@ def rotate_vector(quaternion, vector):
         vy + w * ty + (z * tx - x * tz),
         vz + w * tz + (x * ty - y * tx),
     )
+
+
+def point_in_world(local, base_pose, offset=ARM_MOUNT_OFFSET):
+    """
+    Map a panda_link0 point into the world frame for a base pose.
+
+    ``base_pose`` is the ground-truth pose of base_link: ``local`` gains the
+    fixed base_link -> panda_link0 offset, is rotated by the base yaw and is
+    then translated by the base position. The inverse is ``point_in_arm``.
+    """
+    translation = base_pose.position
+    rotation = base_pose.orientation
+    lifted = (float(local[0]) + offset[0],
+              float(local[1]) + offset[1],
+              float(local[2]) + offset[2])
+    delta = rotate_vector(
+        (rotation.x, rotation.y, rotation.z, rotation.w), lifted)
+    return (translation.x + delta[0],
+            translation.y + delta[1],
+            translation.z + delta[2])
+
+
+def point_in_arm(point, base_pose, offset=ARM_MOUNT_OFFSET):
+    """
+    Map a world-frame point into panda_link0 for a base pose.
+
+    This is the exact inverse of ``point_in_world``. It is used to keep a
+    vision measurement valid after the unbraked chassis has moved: the cube
+    is static in the world, so the world point stays fixed while its
+    panda_link0 coordinates are recomputed from the current base pose.
+    """
+    translation = base_pose.position
+    rotation = base_pose.orientation
+    delta = (float(point[0]) - translation.x,
+             float(point[1]) - translation.y,
+             float(point[2]) - translation.z)
+    local = rotate_vector(
+        inverse_quaternion(
+            (rotation.x, rotation.y, rotation.z, rotation.w)), delta)
+    return (local[0] - offset[0],
+            local[1] - offset[1],
+            local[2] - offset[2])
 
 
 def make_pose(position, quaternion=GRIPPER_DOWN):
@@ -664,20 +793,8 @@ class MobileManipulationNode(Node):
         """
         pose = self.base_pose()
         if pose is not None:
-            origin = pose.position
-            delta = (float(position[0]) - origin.x,
-                     float(position[1]) - origin.y,
-                     float(position[2]) - origin.z)
-            rotation = pose.orientation
-            local = rotate_vector(
-                inverse_quaternion(
-                    (rotation.x, rotation.y, rotation.z, rotation.w)),
-                delta)
-            # The offset points from base_link to panda_link0, so a point's
-            # panda_link0 coordinates are its base coordinates minus it.
-            return Point(x=local[0] - ARM_MOUNT_OFFSET[0],
-                         y=local[1] - ARM_MOUNT_OFFSET[1],
-                         z=local[2] - ARM_MOUNT_OFFSET[2])
+            x, y, z = point_in_arm(position, pose)
+            return Point(x=x, y=y, z=z)
 
         transform = self.tf_buffer.lookup_transform(
             ARM_BASE_FRAME, ODOM_FRAME, Time())
@@ -786,33 +903,42 @@ class MobileManipulationNode(Node):
 
     def send_move_goal(self, goal, timeout=MOVE_TIMEOUT):
         """Send a MoveGroup goal and wait for execution to finish."""
-        send_future = self.move_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(
-            self, send_future, timeout_sec=timeout)
-        if not send_future.done():
-            self.get_logger().error('发送 MoveGroup 目标超时')
-            return False
+        for attempt in range(1, MOVE_ATTEMPTS + 1):
+            send_future = self.move_client.send_goal_async(goal)
+            rclpy.spin_until_future_complete(
+                self, send_future, timeout_sec=timeout)
+            if not send_future.done():
+                self.get_logger().error('发送 MoveGroup 目标超时')
+                return False
 
-        handle = send_future.result()
-        if handle is None or not handle.accepted:
-            self.get_logger().error('MoveIt 拒绝了目标')
-            return False
+            handle = send_future.result()
+            if handle is None or not handle.accepted:
+                self.get_logger().error('MoveIt 拒绝了目标')
+                return False
 
-        result_future = handle.get_result_async()
-        rclpy.spin_until_future_complete(
-            self, result_future, timeout_sec=timeout)
-        if not result_future.done():
-            self.get_logger().error('等待 MoveIt 执行结果超时')
-            handle.cancel_goal_async()
-            return False
+            result_future = handle.get_result_async()
+            rclpy.spin_until_future_complete(
+                self, result_future, timeout_sec=timeout)
+            if not result_future.done():
+                self.get_logger().error('等待 MoveIt 执行结果超时')
+                handle.cancel_goal_async()
+                return False
 
-        result = result_future.result()
-        error_code = result.result.error_code.val if result else None
-        if error_code != MoveItErrorCodes.SUCCESS:
-            self.get_logger().error(
-                'MoveIt 规划/执行失败，MoveItErrorCodes=%s' % error_code)
-            return False
-        return True
+            result = result_future.result()
+            error_code = result.result.error_code.val if result else None
+            if error_code == MoveItErrorCodes.SUCCESS:
+                return True
+            if not move_should_retry(error_code) \
+                    or attempt == MOVE_ATTEMPTS:
+                self.get_logger().error(
+                    'MoveIt 规划/执行失败，MoveItErrorCodes=%s'
+                    % error_code)
+                return False
+            self.get_logger().warning(
+                'MoveIt 返回可重试的错误 %s，重新规划（第 %d/%d 次）'
+                % (error_code, attempt + 1, MOVE_ATTEMPTS))
+            self._spin_for(0.2)
+        return False
 
     def send_cartesian_path(self, waypoints, timeout=MOVE_TIMEOUT,
                             velocity=0.3):
@@ -911,6 +1037,65 @@ class MobileManipulationNode(Node):
             return False
         return True
 
+    def ensure_gripper_open(self, stage):
+        """
+        Open both fingers to the mechanical stop and verify the gap.
+
+        The position controller can settle short of the 0.04 m limit. A pad
+        that is even a few millimetres less open is enough to catch the cube's
+        top edge during the descend, so push against the stops with the effort
+        controller and check the joint values before trusting the opening.
+        """
+        positions = self.finger_positions()
+        if positions is not None and min(positions) \
+                >= GRIPPER_OPEN - GRIPPER_OPEN_TOLERANCE:
+            self.get_logger().info(
+                '%s：夹爪已完全张开 (%0.4f, %0.4f) m。'
+                % (stage, positions[0], positions[1]))
+            return True
+
+        self.get_logger().warning(
+            '%s：夹爪开口不足（%s），用 %.0f N 的力顶到机械限位 ...'
+            % (stage,
+               '未知' if positions is None
+               else '(%0.4f, %0.4f) m' % (positions[0], positions[1]),
+               GRIPPER_OPEN_EFFORT))
+        if not self.switch_controllers(
+                activate=[HAND_EFFORT_CONTROLLER],
+                deactivate=[HAND_POSITION_CONTROLLER]):
+            return False
+
+        command = make_open_effort_command(GRIPPER_OPEN_EFFORT)
+        deadline = time.monotonic() + OPEN_TIMEOUT
+        while rclpy.ok() and time.monotonic() < deadline:
+            self.hand_effort_pub.publish(command)
+            rclpy.spin_once(self, timeout_sec=0.02)
+            positions = self.finger_positions()
+            if positions is not None and min(positions) \
+                    >= GRIPPER_OPEN - GRIPPER_OPEN_TOLERANCE:
+                break
+
+        opened = positions is not None and min(positions) \
+            >= GRIPPER_OPEN - GRIPPER_OPEN_TOLERANCE
+        # The pre-close is a position goal, so the JTC has to own the
+        # interfaces again before the gripper is used for a grasp.
+        switched_back = self.switch_controllers(
+            activate=[HAND_POSITION_CONTROLLER],
+            deactivate=[HAND_EFFORT_CONTROLLER])
+        if not opened:
+            self.get_logger().error(
+                '%s：%.1f s 内夹爪没有顶到最大开口（当前 %s）。'
+                % (stage, OPEN_TIMEOUT,
+                   '未知' if positions is None
+                   else '(%0.4f, %0.4f) m' % (positions[0], positions[1])))
+            return False
+        if not switched_back:
+            return False
+        self.get_logger().info(
+            '%s：夹爪已顶到最大开口 (%0.4f, %0.4f) m。'
+            % (stage, positions[0], positions[1]))
+        return True
+
     def squeeze_gripper(self):
         """Press the cube with a constant force and verify the pads touch it."""
         size = self.grasp['size']
@@ -936,11 +1121,25 @@ class MobileManipulationNode(Node):
         if positions is None:
             self.get_logger().error('没有收到夹爪关节状态')
             return False
+        outcome = squeeze_outcome(positions, size)
+        if outcome == 'corners':
+            detail = (
+                '两指间距接近方块的对角线（%.4f m）。这说明两指没有压在'
+                '两个对面的平面上：要么方块被碰转了约 45 度，要么方块'
+                '整体偏到夹爪一侧、一根手指压在方块的棱上。下探前必须'
+                '把方块和夹爪的中心对齐，并确认夹爪完全张开'
+                % cube_diagonal(size))
+        elif outcome == 'missed':
+            detail = '两指已完全闭合，方块不在两指之间（下探位置偏了）'
+        elif outcome == 'blocked':
+            detail = '两指被两指之间的物体挡住，间距既不是方块宽也不是对角线'
+        else:
+            detail = '夹爪没有进入夹持状态'
         self.get_logger().error(
             '%.1f s 内夹爪没有夹住箱子：关节位置 (%0.4f, %0.4f) m，'
-            '两指间距 %0.4f m，箱子宽 %0.3f m'
+            '两指间距 %0.4f m，箱子宽 %0.3f m。%s'
             % (SQUEEZE_TIMEOUT, positions[0], positions[1],
-               finger_gap(positions), size))
+               finger_gap(positions), size, detail))
         return False
 
     def drive_forward(self, distance=None):
@@ -1003,6 +1202,9 @@ class MobileManipulationNode(Node):
         self.get_logger().info('第二步：张开夹爪 ...')
         if not self.send_move_goal(make_gripper_goal(GRIPPER_OPEN)):
             self.get_logger().error('张开夹爪失败')
+            return False
+        if not self.ensure_gripper_open('张开夹爪后'):
+            self.get_logger().error('夹爪没有完全张开')
             return False
 
         self.get_logger().info('第三步：向前行驶 ...')

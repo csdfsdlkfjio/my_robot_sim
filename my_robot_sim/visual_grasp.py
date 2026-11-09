@@ -23,6 +23,7 @@ cube size, the TCP offset and the height of the top face used by the
 depth-less fallback.
 """
 
+import math
 import time
 from collections import namedtuple
 
@@ -42,6 +43,7 @@ from my_robot_sim.mobile_manipulation_node import (
     GRIPPER_DOWN,
     GRIPPER_OPEN,
     ODOM_FRAME,
+    PRE_CLOSE_CLEARANCE,
     TF_TIMEOUT,
     MobileManipulationNode,
     make_attached_object,
@@ -50,7 +52,8 @@ from my_robot_sim.mobile_manipulation_node import (
     make_pose,
     make_reach_goal,
     make_removed_object,
-    pre_close_position,
+    point_in_world,
+    pre_close_position_for,
     rotate_vector,
 )
 
@@ -73,6 +76,17 @@ MIN_BLOB_AREA = 80  # px^2; a 5 cm cube at the look pose covers thousands
 # image's mixed pixels along the cube's edges and its invalid zeros.
 DEPTH_PATCH_RADIUS = 4
 
+# The cube is seen from the side as well as from above: the colour blob
+# contains the top face and one or two side faces. Sampling the depth under
+# the blob's centroid therefore returned a point on a side face, up to 2.6 cm
+# below the real top and a centimetre off in x/y. The top face is the highest
+# set of points in panda_link0, so select the points within this height of the
+# highest one and average them: the face is horizontal, so its mean is its
+# true centre and its z is the surface the hand must be built from.
+TOP_FACE_HEIGHT_TOLERANCE = 0.006  # m, in panda_link0
+TOP_FACE_STRIDE = 2  # sample every second pixel of the mask
+TOP_FACE_MIN_POINTS = 40
+
 DETECTION_TIMEOUT = 10.0
 REFINE_TIMEOUT = 4.0
 CAMERA_TIMEOUT = 10.0
@@ -90,11 +104,25 @@ SETTLE_AFTER_MOVE = 0.3  # s
 # ~0.42 m above the cube's plane.
 LOOK_POSITION = (0.58, 0.0, 0.42)
 
-# A closer re-detection is only trusted if it does not jump further than
-# this; a wildly different blob is more likely an arm part than the cube.
-MAX_REFINEMENT_SHIFT = 0.05  # m
+# A closer re-detection is only trusted if the cube has not jumped in the
+# *world* frame. Comparing panda_link0 points would reject a valid refinement
+# whenever the unbraked chassis crept while the arm moved, which is exactly
+# the case the refinement has to correct. A world shift beyond this is more
+# likely an arm part than the cube.
+MAX_REFINEMENT_SHIFT = 0.05  # m, between the two vision measurements
 
 Detection = namedtuple('Detection', ['u', 'v', 'area'])
+
+SOURCE_NAMES = {
+    'top': '顶面点云',
+    'depth': '深度图',
+    'plane': '已知高度平面',
+}
+
+
+def source_name(source):
+    """Human-readable name of a target_point_in_arm_frame source."""
+    return SOURCE_NAMES.get(source, str(source))
 
 
 def bgr_image(message):
@@ -221,6 +249,89 @@ def transform_point(transform, point):
             rotated[2] + translation.z)
 
 
+def quaternion_matrix(quaternion):
+    """Return the 3x3 rotation matrix of an (x, y, z, w) quaternion."""
+    x, y, z, w = (float(value) for value in quaternion)
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm < 1e-12:
+        return np.eye(3)
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w),
+         2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z),
+         2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w),
+         1.0 - 2.0 * (x * x + y * y)],
+    ])
+
+
+def transform_points(transform, points):
+    """Apply a TransformStamped to an N x 3 array of points."""
+    rotation = transform.transform.rotation
+    translation = transform.transform.translation
+    matrix = quaternion_matrix(
+        (rotation.x, rotation.y, rotation.z, rotation.w))
+    return np.asarray(points) @ matrix.T + np.array(
+        [translation.x, translation.y, translation.z])
+
+
+def masked_camera_points(mask, depth, fx, fy, cx, cy, stride=TOP_FACE_STRIDE,
+                         min_points=TOP_FACE_MIN_POINTS):
+    """
+    Camera-frame points for the valid depth pixels inside ``mask``.
+
+    A strided sample keeps the array small; the cube still contributes over a
+    thousand points at the look pose. None means there was no usable depth.
+    """
+    height, width = depth.shape[:2]
+    if mask.shape[:2] != (height, width):
+        mask = cv2.resize(
+            mask, (width, height), interpolation=cv2.INTER_NEAREST)
+    rows = np.arange(0, height, stride)
+    columns = np.arange(0, width, stride)
+    sampled = mask[np.ix_(rows, columns)]
+    v, u = np.nonzero(sampled)
+    if u.size == 0:
+        return None
+    u = (u * stride).astype(np.int64)
+    v = (v * stride).astype(np.int64)
+    z = np.asarray(depth[v, u], dtype=np.float64)
+    valid = np.isfinite(z) & (z > 0.0)
+    if int(valid.sum()) < min_points:
+        return None
+    u, v, z = u[valid], v[valid], z[valid]
+    return np.column_stack((
+        (u - cx) * z / fx,
+        (v - cy) * z / fy,
+        z,
+    ))
+
+
+def highest_face_center(points, tolerance=TOP_FACE_HEIGHT_TOLERANCE,
+                        min_points=TOP_FACE_MIN_POINTS):
+    """
+    Centre of the highest horizontal face in an N x 3 arm-frame point set.
+
+    Called with the back-projected, transformed points of the red blob. The
+    top face is the highest part of the cube, and because it is horizontal
+    every point on it has the same z; averaging those points is not biased by
+    the visible side faces, unlike the centroid's depth sample.
+    """
+    if points is None:
+        return None
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[0] < min_points \
+            or points.shape[1] != 3:
+        return None
+    top = float(np.max(points[:, 2]))
+    kept = points[points[:, 2] >= top - float(tolerance)]
+    if kept.shape[0] < min_points:
+        return None
+    centre = kept.mean(axis=0)
+    return (float(centre[0]), float(centre[1]), float(centre[2]))
+
+
 def transform_direction(transform, direction):
     """Rotate a direction (no translation) into the target frame."""
     rotation = transform.transform.rotation
@@ -285,6 +396,10 @@ class VisualGraspNode(MobileManipulationNode):
         self.image_frame = None
         self.camera_info = None
         self.depth = None
+        # Cube top-face point in the world frame. The cube does not move
+        # before the grasp, so this is the stable measurement; panda_link0
+        # coordinates are recomputed from it whenever the base has crept.
+        self.surface_world = None
         self.debug_pub = self.create_publisher(
             Image, DEBUG_IMAGE_TOPIC, 10)
         self.create_subscription(
@@ -410,12 +525,13 @@ class VisualGraspNode(MobileManipulationNode):
 
     def target_point_in_arm_frame(self, detection):
         """
-        Return ((x, y, z) in panda_link0, 'depth' or 'plane').
+        Return ((x, y, z) in panda_link0, source).
 
-        With a depth image the pixel is back-projected directly. Without one,
-        the ray is intersected with the cube's known top-face height; the
-        pixel still decides where in the plane the cube is, so the grasp is
-        still guided by the image.
+        With a depth image the whole red blob is back-projected and the
+        highest horizontal face is averaged; that is the cube's top face
+        centre, without the side-face bias of a single centroid sample. If the
+        depth is unusable, the pixel ray is intersected with the cube's known
+        top-face height instead, so the grasp is still guided by the image.
         """
         if self.camera_info is None:
             raise RuntimeError('没有相机内参')
@@ -425,6 +541,15 @@ class VisualGraspNode(MobileManipulationNode):
             raise RuntimeError(
                 '超时：没有 %s -> %s 的 TF'
                 % (self.image_frame, ARM_BASE_FRAME))
+
+        if self.depth is not None and self.color_image is not None:
+            points = masked_camera_points(
+                red_mask(self.color_image), self.depth, fx, fy, cx, cy)
+            if points is not None:
+                centre = highest_face_center(
+                    transform_points(transform, points))
+                if centre is not None:
+                    return centre, 'top'
 
         depth = self.depth_at(detection.u, detection.v)
         if depth is not None:
@@ -469,8 +594,38 @@ class VisualGraspNode(MobileManipulationNode):
         self.get_logger().info(
             '方块上表面在 %s 下为 (%0.4f, %0.4f, %0.4f)，来源：%s'
             % (ARM_BASE_FRAME, point[0], point[1], point[2],
-               '深度图' if source == 'depth' else '已知高度平面'))
+               source_name(source)))
+        self.remember_surface_world(point)
         return point
+
+    def remember_surface_world(self, surface):
+        """Store the measured top-face point in the world frame."""
+        pose = self.base_pose()
+        if pose is None:
+            self.surface_world = None
+            return None
+        self.surface_world = point_in_world(surface, pose)
+        self.get_logger().info(
+            '方块上表面的世界坐标为 (%0.4f, %0.4f, %0.4f)；'
+            '之后底盘再滑动也会用这个世界坐标重新计算抓取点'
+            % self.surface_world)
+        return self.surface_world
+
+    def compensated_surface(self, fallback, stage):
+        """Cube point in the current panda_link0 frame after base motion."""
+        if self.surface_world is None or self.base_pose() is None:
+            return fallback
+        point = self.point_in_arm_frame(self.surface_world)
+        current = (point.x, point.y, point.z)
+        shift = math.hypot(
+            current[0] - fallback[0], current[1] - fallback[1])
+        if shift > 0.001:
+            self.get_logger().info(
+                '%s：底盘移动了 %.1f mm，按世界坐标把方块目标修正到 '
+                '(%0.4f, %0.4f, %0.4f) [%s]'
+                % (stage, shift * 1000.0, current[0], current[1],
+                   current[2], ARM_BASE_FRAME))
+        return current
 
     def refine_target(self, previous):
         """Try a closer detection once the hand is above the cube."""
@@ -478,9 +633,29 @@ class VisualGraspNode(MobileManipulationNode):
         if detection is None:
             self.get_logger().warning(
                 '近距离重新检测失败，沿用第一次测量的坐标')
-            return previous
+            return self.compensated_surface(previous, '近距离检测失败')
+
         self.publish_debug_image(detection)
         point, source = self.target_point_in_arm_frame(detection)
+        pose = self.base_pose()
+        if self.surface_world is not None and pose is not None:
+            candidate_world = point_in_world(point, pose)
+            shift = max(
+                abs(candidate_world[index] - self.surface_world[index])
+                for index in range(3))
+            if shift > MAX_REFINEMENT_SHIFT:
+                self.get_logger().warning(
+                    '近距离测量的世界坐标跳变 %.1f cm，可能检到了机械臂本身，'
+                    '沿用第一次坐标' % (shift * 100.0))
+                return self.compensated_surface(previous, '近距离测量跳变')
+            self.surface_world = candidate_world
+            self.get_logger().info(
+                '近距离修正：(%0.4f, %0.4f, %0.4f)，来源：%s，'
+                '世界坐标修正量 %.1f cm'
+                % (point[0], point[1], point[2],
+                   source_name(source), shift * 100.0))
+            return point
+
         shift = max(abs(point[0] - previous[0]),
                     abs(point[1] - previous[1]))
         if shift > MAX_REFINEMENT_SHIFT:
@@ -491,8 +666,7 @@ class VisualGraspNode(MobileManipulationNode):
         self.get_logger().info(
             '近距离修正：(%0.4f, %0.4f, %0.4f)，来源：%s，修正量 %.1f cm'
             % (point[0], point[1], point[2],
-               '深度图' if source == 'depth' else '已知高度平面',
-               shift * 100.0))
+               source_name(source), shift * 100.0))
         return point
 
     def run(self):
@@ -521,6 +695,9 @@ class VisualGraspNode(MobileManipulationNode):
         self.get_logger().info('第二步：张开夹爪 ...')
         if not self.send_move_goal(make_gripper_goal(GRIPPER_OPEN)):
             self.get_logger().error('张开夹爪失败')
+            return False
+        if not self.ensure_gripper_open('张开夹爪后'):
+            self.get_logger().error('夹爪没有完全张开')
             return False
 
         self.get_logger().info('第三步：向前行驶 ...')
@@ -579,6 +756,7 @@ class VisualGraspNode(MobileManipulationNode):
         self.get_logger().info(
             '伸爪前重新读取底盘朝向：q=(%0.3f, %0.3f, %0.3f, %0.3f)'
             % gripper_orientation)
+        surface = self.compensated_surface(surface, '伸爪前')
 
         size = self.grasp['size']
         tcp_offset = self.grasp['tcp_offset']
@@ -599,20 +777,46 @@ class VisualGraspNode(MobileManipulationNode):
             self.get_logger().error('伸向方块上方失败')
             return False
 
-        refined = self.refine_target(surface)
-        if refined != surface:
-            surface = refined
-            grasp = hand_position_for_surface(surface, size, tcp_offset)
-            box_centre = (surface[0], surface[1], surface[2] - size / 2.0)
-            box_object = make_box_object(
-                box_centre, (size, size, size), object_id=BOX_OBJECT_ID)
-            self.publish_collision_objects([box_object])
+        surface = self.refine_target(surface)
 
+        # The chassis is unbraked and can creep while the arm folds down to
+        # the pre-grasp. Rebuild the grasp from the world-frame measurement
+        # after the motion; otherwise a 1 cm base slide leaves the pads beside
+        # the cube instead of around it.
         self._spin_for(SETTLE_AFTER_MOVE)
+        surface = self.compensated_surface(surface, '下探前')
+        grasp = hand_position_for_surface(surface, size, tcp_offset)
+        corrected_pre_grasp = lifted_position(
+            grasp, size / 2.0 + self.grasp['approach_clearance'])
+        shift = max(abs(corrected_pre_grasp[0] - pre_grasp[0]),
+                    abs(corrected_pre_grasp[1] - pre_grasp[1]))
+        if shift > 0.002:
+            self.get_logger().info(
+                '方块相对夹爪移动了 %.1f cm，先重新移到方块正上方再下探 ...'
+                % (shift * 100.0))
+            gripper_orientation = self.orientation_in_arm_frame(GRIPPER_DOWN)
+            if not self.send_move_goal(make_reach_goal(
+                    corrected_pre_grasp, gripper_orientation)):
+                self.get_logger().error('重新对准方块上方失败')
+                return False
+            self._spin_for(SETTLE_AFTER_MOVE)
+            surface = self.compensated_surface(surface, '重新对准后')
+            grasp = hand_position_for_surface(surface, size, tcp_offset)
+
+        box_centre = (surface[0], surface[1], surface[2] - size / 2.0)
+        box_object = make_box_object(
+            box_centre, (size, size, size), object_id=BOX_OBJECT_ID)
+        self.publish_collision_objects([box_object])
         gripper_orientation = self.orientation_in_arm_frame(GRIPPER_DOWN)
         self.get_logger().info(
             '下探前重新读取底盘朝向：q=(%0.3f, %0.3f, %0.3f, %0.3f)'
             % gripper_orientation)
+        # The hand is about to pass the cube with the pads a few millimetres
+        # away; one pad that drifted shut would catch the top edge. Verify the
+        # open gap, and push the fingers against the stops if it fell short.
+        if not self.ensure_gripper_open('下探前'):
+            self.get_logger().error('下探前夹爪没有完全张开')
+            return False
 
         self.get_logger().info(
             '第七步：垂直下探到方块中心，手的目标为 '
@@ -623,12 +827,37 @@ class VisualGraspNode(MobileManipulationNode):
             self.get_logger().error('下探到方块中心失败')
             return False
 
+        # The pads descend fully open, so they nominally clear each face by
+        # 15 mm. If the base slid further during the descend, closing would
+        # hit the cube's top edge and push it sideways; stop while the cube is
+        # still untouched.
+        surface = self.compensated_surface(surface, '下探后')
+        lateral = math.hypot(
+            surface[0] - grasp[0], surface[1] - grasp[1])
+        lateral_y = abs(surface[1] - grasp[1])
+        self.get_logger().info(
+            '下探后夹爪中心与方块中心的水平偏差为 %.1f mm（沿手指方向 '
+            '%.1f mm，允许 %.1f mm）。'
+            % (lateral * 1000.0, lateral_y * 1000.0,
+               PRE_CLOSE_CLEARANCE * 1000.0))
+        if lateral > PRE_CLOSE_CLEARANCE:
+            self.get_logger().error(
+                '方块偏离夹爪中心 %.1f mm，超过 %.1f mm 的预闭合间隙；'
+                '此时闭爪会撞到方块边缘。已中止，避免把方块顶到一侧后'
+                '捏在它的棱上。请重跑，让底盘停稳后再下探。'
+                % (lateral * 1000.0, PRE_CLOSE_CLEARANCE * 1000.0))
+            return False
+
+        # Close the position gap down to a few millimetres on the near face
+        # before the force stage. The press then only has to travel that
+        # little, so it seats the pads instead of accelerating them into the
+        # cube, which is what dragged the cube sideways in earlier runs.
+        pre_close = pre_close_position_for(size, lateral_y)
         self.get_logger().info(
             '第八步：预闭合夹爪到 %.3f m，再用 %.1f N 的力夹紧 %.2f m 的方块 ...'
-            % (pre_close_position(size), self.grasp['squeeze_effort'], size))
+            % (pre_close, self.grasp['squeeze_effort'], size))
         self.publish_collision_objects([make_removed_object(BOX_OBJECT_ID)])
-        if not self.send_move_goal(
-                make_gripper_goal(pre_close_position(size))):
+        if not self.send_move_goal(make_gripper_goal(pre_close)):
             self.get_logger().error('预闭合夹爪失败')
             return False
         if not self.squeeze_gripper():
