@@ -107,8 +107,9 @@ def box_sdf(config):
     Return the SDF for the dynamic grasp cube.
 
     The cube is spawned at the configured pose, so the model itself carries
-    no pose. Orange makes it obvious in gzclient, and the high friction plus
-    the small mass are what let the fingers actually carry it.
+    no pose. Red is what the wrist camera's colour threshold looks for (see
+    visual_grasp.py), and the high friction plus the small mass are what let
+    the fingers actually carry it.
     """
     size = config['size']
     mass = config['mass']
@@ -152,7 +153,7 @@ def box_sdf(config):
         <material>
           <script>
             <uri>file://media/materials/scripts/gazebo.material</uri>
-            <name>Gazebo/Orange</name>
+            <name>Gazebo/Red</name>
           </script>
         </material>
       </visual>

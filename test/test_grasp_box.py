@@ -62,7 +62,7 @@ def test_pedestal_top_meets_the_cube_bottom():
 
 
 def test_box_sdf_is_a_dynamic_cube_with_grasp_friction():
-    """The cube must be liftable and visibly orange in gzclient."""
+    """The cube must be liftable and visibly red for the camera."""
     config = load_config(CONFIG)
     model = ET.fromstring(box_sdf(config)).find('model')
     assert model.get('name') == 'grasp_box'
@@ -86,7 +86,7 @@ def test_box_sdf_is_a_dynamic_cube_with_grasp_friction():
     assert float(link.find(
         'collision/surface/friction/ode/mu2').text) == \
         pytest.approx(config['friction'])
-    assert link.find('visual/material/script/name').text == 'Gazebo/Orange'
+    assert link.find('visual/material/script/name').text == 'Gazebo/Red'
 
 
 def test_box_sdf_names_match_the_attach_command():
