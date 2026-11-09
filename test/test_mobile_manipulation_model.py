@@ -140,6 +140,84 @@ def test_robot_model_loads_the_grasp_attach_plugin(robot):
     assert plugin.get('filename') == 'libgazebo_grasp_attach.so'
 
 
+def test_wrist_camera_is_mounted_on_the_hand(robot):
+    """
+    The camera must look along the fingers (down while grasping).
+
+    Gazebo renders a camera along its link's +x axis, so the mount has to
+    pitch the link by -90 degrees: the hand's +z axis is the finger direction.
+    The optical frame is the conventional ROS camera frame (z forward, x
+    right, y down) and is what the images are stamped with. Both frames are
+    fixed joints in the URDF, so robot_state_publisher publishes them.
+    """
+    joints = named(robot, 'joint')
+    mount = joints['camera_joint']
+    assert mount.get('type') == 'fixed'
+    assert mount.find('parent').get('link') == 'panda_hand'
+    assert mount.find('child').get('link') == 'camera_link'
+    origin = mount.find('origin')
+    assert [float(value) for value in origin.get('xyz').split()] == \
+        pytest.approx([0.0, 0.05, 0.0])
+    assert [float(value) for value in origin.get('rpy').split()] == \
+        pytest.approx([0.0, -1.5707963, 0.0])
+
+    optical = joints['camera_optical_joint']
+    assert optical.get('type') == 'fixed'
+    assert optical.find('parent').get('link') == 'camera_link'
+    assert optical.find('child').get('link') == 'camera_optical_link'
+    assert [float(value)
+            for value in optical.find('origin').get('rpy').split()] == \
+        pytest.approx([-1.5707963, 0.0, -1.5707963])
+
+    links = named(robot, 'link')
+    # The camera body must not collide with the cube the gripper picks up.
+    assert links['camera_link'].find('collision') is None
+    assert links['camera_link'].find('inertial') is not None
+    references = {
+        block.get('reference'): block for block in robot.findall('gazebo')}
+    assert references['camera_link'].findtext('material').strip() == \
+        'Gazebo/DarkGrey'
+
+
+def test_camera_sensor_reaches_the_gazebo_model(urdf_text):
+    """
+    The sensor must survive the URDF->SDF conversion with its plugin intact.
+
+    The camera link is fixed to panda_hand, which Gazebo already lumps into
+    panda_link7; the converter moves the sensor along with the lumped visual,
+    and drops it entirely if the <gazebo reference> block is malformed.
+    """
+    with tempfile.NamedTemporaryFile(
+            'w', suffix='.urdf', delete=False) as handle:
+        handle.write(urdf_text)
+        path = handle.name
+    try:
+        result = subprocess.run(
+            ['gz', 'sdf', '-p', path], capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, result.stderr
+    root = ET.fromstring(result.stdout)
+
+    sensors = [sensor for sensor in root.iter('sensor')
+               if sensor.get('name') == 'arm_camera']
+    assert len(sensors) == 1
+    sensor = sensors[0]
+    assert sensor.get('type') == 'camera'
+    assert float(sensor.findtext('update_rate')) == pytest.approx(30.0)
+    image = sensor.find('camera/image')
+    assert int(image.findtext('width')) == 640
+    assert int(image.findtext('height')) == 480
+    assert image.findtext('format').strip() == 'R8G8B8'
+    plugin = sensor.find('plugin')
+    assert plugin.get('filename') == 'libgazebo_ros_camera.so'
+    # camera_name prefixes the topics: /camera/image_raw and
+    # /camera/camera_info. frame_name must match the optical frame that
+    # robot_state_publisher publishes, or the image TF is disconnected.
+    assert plugin.findtext('camera_name').strip() == 'camera'
+    assert plugin.findtext('frame_name').strip() == 'camera_optical_link'
+
+
 def test_ros2_control_owns_only_the_arm(robot):
     """Every <ros2_control> joint must be a Panda joint, never a wheel."""
     systems = robot.findall('ros2_control')

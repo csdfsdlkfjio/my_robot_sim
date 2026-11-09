@@ -76,7 +76,66 @@
     <origin xyz="0 0 0.005"/>
   </joint>
 
-  <!-- ================= 5. 机械臂 ros2_control（Gazebo 硬件） ================= -->
+  <!-- ================= 5. 腕部 RGB 相机 ================= -->
+  <!-- 相机装在手掌左侧，光轴沿手指方向（夹取时朝下），用来观察夹爪前方的
+       物体。相机本体只有视觉和惯量：它没有碰撞体，因此不会伸进夹爪间隙或
+       顶到箱子。
+       Gazebo 的相机沿 link 的 +x 方向看，所以 camera_link 相对 panda_hand
+       绕 y 轴转 -90 度，让 +x 对齐手掌的 +z（手指方向）。光学坐标系按 ROS
+       约定（z 向前、x 向右、y 向下）作为 camera_link 的固定子帧，图像的
+       frame_id 用这个光学帧；这两个帧都由 robot_state_publisher 从 URDF
+       自动发布到 /tf。 -->
+  <link name="camera_link">
+    <visual>
+      <geometry><box size="0.02 0.05 0.03"/></geometry>
+      <material name="camera_dark"><color rgba="0.10 0.10 0.12 1.0"/></material>
+    </visual>
+    <inertial>
+      <mass value="0.05"/>
+      <inertia ixx="1.417e-05" iyy="5.417e-06" izz="1.208e-05"
+               ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="camera_joint" type="fixed">
+    <parent link="panda_hand"/>
+    <child link="camera_link"/>
+    <origin xyz="0 0.05 0" rpy="0 -1.5707963 0"/>
+  </joint>
+  <link name="camera_optical_link"/>
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_optical_link"/>
+    <origin xyz="0 0 0" rpy="-1.5707963 0 -1.5707963"/>
+  </joint>
+
+  <gazebo reference="camera_link">
+    <material>Gazebo/DarkGrey</material>
+    <sensor name="arm_camera" type="camera">
+      <always_on>true</always_on>
+      <update_rate>30</update_rate>
+      <camera>
+        <horizontal_fov>1.0472</horizontal_fov>
+        <image>
+          <width>640</width>
+          <height>480</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.02</near>
+          <far>10.0</far>
+        </clip>
+      </camera>
+      <!-- camera_name 是话题前缀：在根命名空间下得到 /camera/image_raw 和
+           /camera/camera_info。frame_name 与 URDF 里的光学帧一致，TF 由
+           robot_state_publisher 提供。 -->
+      <plugin name="arm_camera_controller" filename="libgazebo_ros_camera.so">
+        <camera_name>camera</camera_name>
+        <frame_name>camera_optical_link</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- ================= 6. 机械臂 ros2_control（Gazebo 硬件） ================= -->
   <!-- 只包含 Panda 的 9 个关节；轮子交给差速插件，绝不重复。 -->
   <ros2_control name="PandaGazeboSystem" type="system">
     <hardware>
@@ -173,7 +232,7 @@
     <plugin name="grasp_attach" filename="libgazebo_grasp_attach.so"/>
   </gazebo>
 
-  <!-- ================= 6. 启动 Gazebo 里的 ros2_control ================= -->
+  <!-- ================= 7. 启动 Gazebo 里的 ros2_control ================= -->
   <gazebo>
     <plugin name="gazebo_ros2_control" filename="libgazebo_ros2_control.so">
       <!-- xacro 在生成 URDF 时把 $(find ...) 展开成安装目录的绝对路径 -->
