@@ -108,6 +108,11 @@ def test_diff_drive_plugin_owns_only_wheels(robot):
     assert diff_drive.find('right_joint').text.strip() == 'right_wheel_joint'
     assert diff_drive.find('publish_odom').text.strip() == 'true'
     assert diff_drive.find('publish_odom_tf').text.strip() == 'true'
+    # Encoder odometry slips during the search's in-place turns; world
+    # odometry keeps /odom (and the odom->base_link TF AMCL follows) on the
+    # true Gazebo pose. The plugin parses this tag with Get<int>, so it must
+    # be 1 (world); the string "world" would be read as 0 (encoder).
+    assert diff_drive.find('odometry_source').text.strip() == '1'
 
 
 def test_ground_truth_odometry_plugin_tracks_base_link(robot):

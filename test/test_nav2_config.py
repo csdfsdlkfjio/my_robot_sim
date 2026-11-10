@@ -23,6 +23,23 @@ def test_amcl_uses_base_link():
     assert amcl['use_sim_time'] is True
 
 
+def test_amcl_uses_the_beam_model_next_to_the_long_table():
+    """
+    A likelihood field treats points inside the 0.6 m thick table as perfect.
+
+    With the base parked at the lateral standoff, scan endpoints that fall
+    inside the table are at distance zero from an occupied cell, so AMCL
+    happily slides 0.45 m east into the table (observed: vision placed the
+    cube at 1.72 m while Gazebo had it at 1.45 m). The beam model raycasts
+    each beam and penalises the ones that would have crossed the table.
+    """
+    amcl = load_params()['amcl']['ros__parameters']
+    assert amcl['laser_model_type'] == 'beam'
+    # The two boxes must stay visible, otherwise the 8 x 8 m room is
+    # symmetric under 90 degree turns.
+    assert amcl['max_beams'] == 360
+
+
 def test_costmaps_use_base_link():
     """代价地图与机器人的实际 base frame 保持一致."""
     params = load_params()

@@ -1,10 +1,10 @@
 amcl:
   ros__parameters:
     use_sim_time: True
-    # Gazebo 的差速轮插件把 /odom 报得和真实位姿一样准（实测与
-    # /ground_truth/odom 完全一致），而 0.2 的默认噪声模型会在原地旋转时
-    # 把粒子云摊开。8x8 m 的方形房间在 90 度旋转下几乎对称，摊开的粒子
-    # 会被错误的对称假设吸走：实测搜索旋转中偏航误差最大到 48 度，
+    # /odom 直接使用 Gazebo 里的真实位姿（my_car.urdf 的
+    # odometry_source=1，即 world），不是会打滑的轮式积分。0.2 的默认噪声模型
+    # 仍会把粒子云摊开，而 8x8 m 方形房间在 90 度旋转下近乎对称，摊开的
+    # 粒子会被错误的对称假设吸走：实测搜索旋转中偏航误差最大到 48 度，
     # Find-Drive-Grasp 因此把方块定位偏了半米。噪声调到 0.01 后，同样的
     # 12 步旋转全程偏航误差 <= 1.8 度。
     alpha1: 0.01
@@ -26,7 +26,12 @@ amcl:
     laser_likelihood_max_dist: 2.0
     laser_max_range: 100.0
     laser_min_range: -1.0
-    laser_model_type: "likelihood_field"
+    # 长桌 0.6 m 厚，似然场会把“落在桌面内部”的光线端点算成到障碍物
+    # 距离 0（完美命中），于是底盘在桌边时 AMCL 会滑进一个沿 x 平移
+    # 0.45 m 的假位姿（实测视觉目标算到 1.72 m，真值 1.45 m）。beam 模型
+    # 对每条光线做地图 raycast，穿过桌体的光线会被 z_short/z_rand 重罚，
+    # 因此不会把位姿吸进桌子内部。
+    laser_model_type: "beam"
     # 用满 360 条雷达光线：房间里只有两个箱子能打破 90 度对称，60 条
     # 光线时它们的贡献被四面墙淹没。
     max_beams: 360

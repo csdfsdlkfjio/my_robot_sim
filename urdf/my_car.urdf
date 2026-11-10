@@ -102,6 +102,14 @@
            默认都是 false，不显式打开就不会创建 /odom 和 odom->base_link 的 TF -->
       <publish_odom>true</publish_odom>
       <publish_odom_tf>true</publish_odom_tf>
+      <!-- 里程计来源必须是整数：0 = encoder，1 = world。插件用 Get<int>
+           解析这个标签，写成字符串 "world" 会落到 0（encoder），反而退回
+           只积分轮子转角的模式；原地旋转时轮子打滑，实测 12 步 30 度搜索
+           后 /odom 偏航误差接近 180 度、位置偏 10~18 cm，AMCL 跟着偏，
+           搜索算出的 standoff 目标会贴到长桌上。1 直接取 Gazebo 里的
+           真实位姿，/odom 和 odom->base_link 都与世界一致；差速底盘仍然
+           由同一组轮子驱动，只是里程计不再靠打滑的轮子推算。 -->
+      <odometry_source>1</odometry_source>
       <odometry_frame>odom</odometry_frame>
       <robot_base_frame>base_link</robot_base_frame>
     </plugin>
