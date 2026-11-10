@@ -180,16 +180,20 @@ def test_run_order_is_search_then_navigate_then_grasp():
     grasp = run.index('self.grasp_after_arrival()')
     retreat = run.index('self.retreat()')
     assert search < navigate < grasp
-    # The retry happens after the first grasp attempt, in the same loop.
+    # The retry happens after the first grasp attempt, in the same loop, and
+    # re-approaches the cube before grasping again: 0.7 m away the wrist
+    # camera is too far to measure the cube reliably.
     assert grasp < retreat
+    assert 'self.navigate_to_cube(cube_xy)' in run[retreat:]
 
 
 def test_search_uses_the_camera_not_the_lidar():
     """
-    The lidar scans at 0.30 m; the cube's top face is at 0.275 m.
+    The scan plane is at z ~= 0.25 m and only grazes the 5 cm cube.
 
-    A scan-based search would never see the cube, so the module must not
-    subscribe to /scan.
+    Even when a ray hits it, a scan cannot tell the red cube from the
+    pedestal, the walls or the other boxes, so the search must rely on the
+    wrist camera and must not subscribe to /scan.
     """
     with open(MODULE, encoding='utf-8') as handle:
         source = handle.read()

@@ -8,25 +8,30 @@ Stages:
                   Nav2's NavigateToPose action and wait for the base;
     3. grasp    - run the visual-grasp sequence (VisualGraspNode) on the
                   settled base;
-    4. retry    - back away 20 cm and run the grasp once more if it failed.
+    4. retry    - back away 20 cm, drive back to the standoff and run the
+                  grasp once more if it failed.
 
-Why the camera and not the lidar: the lidar scans at z = 0.30 m, while the
-cube's top face is at 0.275 m and its pedestal is 0.225 m tall, so the scan
-plane passes above the cube and the pedestal entirely. The wrist camera is
-the only sensor that can see the cube.
+Why the camera and not the lidar: lidar_link sits 5 cm above base_link, which
+is 0.20 m high, so the scan plane is at z ~= 0.25 m -- it grazes the cube
+(0.225-0.275 m) and only a couple of rays can hit it. A scan can also never
+identify the cube as red: the pedestal, the walls and the blue/orange boxes
+all come back as obstacles. The wrist camera is the sensor that both sees the
+small cube and knows its colour.
 
 Usage:
     world=$(ros2 pkg prefix --share my_robot_sim)/worlds/demo.world
     ros2 launch my_robot_sim mobile_manipulation.launch.py world:=$world
     ros2 launch my_robot_sim nav2.launch.py
-    # give AMCL an initial pose in RViz (2D Pose Estimate), or pass
-    # initial_x / initial_y / initial_yaw / publish_initial_pose:=true
+    # config/nav2_params.yaml already gives AMCL the map's initial pose.
+    # If the robot has moved, pass initial_x / initial_y / initial_yaw with
+    # publish_initial_pose:=true, or set it in RViz with 2D Pose Estimate.
     ros2 run my_robot_sim search_and_grasp
 
-The map frame of this workspace (maps/my_map.pgm) is rotated relative to the
-Gazebo world, so "0, 0, 0" is not the robot's pose in the map. The node never
-converts ground-truth world coordinates into map goals: everything that goes
-to Nav2 is expressed through the map -> base_link TF that AMCL publishes.
+maps/my_map.pgm is generated from demo.world's geometry in the world frame,
+so the robot's spawn pose is (0, 0, 0) in the map and that is the initial pose
+in config/nav2_params.yaml. The node still never converts ground-truth world
+coordinates into map goals: everything that goes to Nav2 is expressed through
+the map -> base_link TF that AMCL publishes.
 """
 
 import math
@@ -519,9 +524,18 @@ class SearchAndGraspNode(VisualGraspNode):
             if attempt == GRASP_ATTEMPTS:
                 break
             self.get_logger().warning(
-                '抓取失败，后退 %.0f cm 后重新观察再试一次 ...'
+                '抓取失败，后退 %.0f cm 后重新导航到方块前再试一次 ...'
                 % (RETREAT_DISTANCE * 100.0))
-            self.retreat()
+            if not self.retreat():
+                self.get_logger().error('后退失败，无法重试抓取')
+                return False
+            # Backing off leaves the robot ~0.7 m from the cube, where the
+            # wrist camera sees only a small, edge-on view. Drive back to the
+            # standoff so the retry starts from the geometry the grasp was
+            # tuned for.
+            if not self.navigate_to_cube(cube_xy):
+                self.get_logger().error('后退后重新导航失败，无法重试抓取')
+                return False
         self.get_logger().error('视觉抓取失败：重试后仍未夹起方块。')
         return False
 
