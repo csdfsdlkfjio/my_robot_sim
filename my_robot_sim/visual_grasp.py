@@ -87,6 +87,17 @@ TOP_FACE_HEIGHT_TOLERANCE = 0.006  # m, in panda_link0
 TOP_FACE_STRIDE = 2  # sample every second pixel of the mask
 TOP_FACE_MIN_POINTS = 40
 
+# The wrist camera is mounted over one finger pad, and at the look pose that
+# pad hides the near part of the top face: only a strip along the far edge is
+# visible and its mean is pulled towards the camera (17 mm against Gazebo
+# ground truth, measured on the live camera). That bias placed the hand off
+# the cube, so the descend scraped a pad and the cube was never seated. When
+# the visible strip is clearly shorter than the cube edge, the far edge is
+# still a real cube edge, so the centre is rebuilt half an edge inwards from
+# it. A face that is (almost) fully visible, including a cube yawed to 10-45
+# degrees, keeps the plain mean, which has no such bias.
+FULL_FACE_FRACTION = 0.9
+
 DETECTION_TIMEOUT = 10.0
 REFINE_TIMEOUT = 4.0
 CAMERA_TIMEOUT = 10.0
@@ -309,7 +320,8 @@ def masked_camera_points(mask, depth, fx, fy, cx, cy, stride=TOP_FACE_STRIDE,
 
 
 def highest_face_center(points, tolerance=TOP_FACE_HEIGHT_TOLERANCE,
-                        min_points=TOP_FACE_MIN_POINTS):
+                        min_points=TOP_FACE_MIN_POINTS, closing_axis=None,
+                        size=None, viewer=None):
     """
     Centre of the highest horizontal face in an N x 3 arm-frame point set.
 
@@ -317,6 +329,16 @@ def highest_face_center(points, tolerance=TOP_FACE_HEIGHT_TOLERANCE,
     top face is the highest part of the cube, and because it is horizontal
     every point on it has the same z; averaging those points is not biased by
     the visible side faces, unlike the centroid's depth sample.
+
+    The mean is only correct when the whole face is visible. The finger pad
+    between the camera and the cube hides part of the face at the look pose,
+    so ``closing_axis`` (the finger closing direction, unit or not), ``size``
+    (cube edge) and ``viewer`` (the camera origin, same frame) recentre a
+    clipped face from its far edge: the visible strip reaches the cube edge
+    away from the camera, and the centre is half an edge back towards the
+    camera. A face whose span along the axis is at least
+    ``FULL_FACE_FRACTION`` of ``size`` is treated as complete and keeps the
+    mean.
     """
     if points is None:
         return None
@@ -329,6 +351,26 @@ def highest_face_center(points, tolerance=TOP_FACE_HEIGHT_TOLERANCE,
     if kept.shape[0] < min_points:
         return None
     centre = kept.mean(axis=0)
+    if closing_axis is not None and size is not None and viewer is not None:
+        axis = np.asarray(closing_axis, dtype=np.float64)
+        norm = float(np.linalg.norm(axis))
+        edge = float(size)
+        if norm > 1e-9 and edge > 0.0:
+            axis = axis / norm
+            projection = kept @ axis
+            low = float(projection.min())
+            high = float(projection.max())
+            if high - low < FULL_FACE_FRACTION * edge:
+                viewer_edge = float(np.dot(
+                    np.asarray(viewer, dtype=np.float64), axis))
+                # The occluded end is the one nearest the camera, so the real
+                # cube edge is the projection extreme farthest from it.
+                if viewer_edge >= 0.5 * (low + high):
+                    far_edge, towards_viewer = low, 1.0
+                else:
+                    far_edge, towards_viewer = high, -1.0
+                wanted = far_edge + towards_viewer * edge / 2.0
+                centre = centre + (wanted - float(centre @ axis)) * axis
     return (float(centre[0]), float(centre[1]), float(centre[2]))
 
 
@@ -523,7 +565,12 @@ class VisualGraspNode(MobileManipulationNode):
             u, v, self.color_image.shape, self.depth.shape)
         return depth_from_patch(self.depth, depth_u, depth_v)
 
-    def target_point_in_arm_frame(self, detection):
+    def closing_axis_in_arm_frame(self):
+        """Finger closing direction (hand +y) in panda_link0."""
+        return rotate_vector(
+            self.orientation_in_arm_frame(GRIPPER_DOWN), (0.0, 1.0, 0.0))
+
+    def target_point_in_arm_frame(self, detection, closing_axis=None):
         """
         Return ((x, y, z) in panda_link0, source).
 
@@ -532,6 +579,12 @@ class VisualGraspNode(MobileManipulationNode):
         centre, without the side-face bias of a single centroid sample. If the
         depth is unusable, the pixel ray is intersected with the cube's known
         top-face height instead, so the grasp is still guided by the image.
+
+        ``closing_axis`` is only passed by the grasp flow, where the gripper
+        points down and its pads hide part of the top face: the measurement
+        is then recentred from the visible far edge (see
+        ``highest_face_center``). The search flow looks forward, where the
+        pads are not over the cube, and keeps the plain mean.
         """
         if self.camera_info is None:
             raise RuntimeError('没有相机内参')
@@ -547,7 +600,10 @@ class VisualGraspNode(MobileManipulationNode):
                 red_mask(self.color_image), self.depth, fx, fy, cx, cy)
             if points is not None:
                 centre = highest_face_center(
-                    transform_points(transform, points))
+                    transform_points(transform, points),
+                    closing_axis=closing_axis,
+                    size=self.grasp['size'],
+                    viewer=transform_point(transform, (0.0, 0.0, 0.0)))
                 if centre is not None:
                     return centre, 'top'
 
@@ -590,7 +646,8 @@ class VisualGraspNode(MobileManipulationNode):
             '检测到红色方块：像素 (%0.1f, %0.1f)，面积 %0.0f px²'
             % (detection.u, detection.v, detection.area))
 
-        point, source = self.target_point_in_arm_frame(detection)
+        point, source = self.target_point_in_arm_frame(
+            detection, self.closing_axis_in_arm_frame())
         self.get_logger().info(
             '方块上表面在 %s 下为 (%0.4f, %0.4f, %0.4f)，来源：%s'
             % (ARM_BASE_FRAME, point[0], point[1], point[2],
@@ -636,7 +693,8 @@ class VisualGraspNode(MobileManipulationNode):
             return self.compensated_surface(previous, '近距离检测失败')
 
         self.publish_debug_image(detection)
-        point, source = self.target_point_in_arm_frame(detection)
+        point, source = self.target_point_in_arm_frame(
+            detection, self.closing_axis_in_arm_frame())
         pose = self.base_pose()
         if self.surface_world is not None and pose is not None:
             candidate_world = point_in_world(point, pose)

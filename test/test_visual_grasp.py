@@ -307,6 +307,55 @@ def test_highest_face_center_ignores_the_side_faces():
     assert centre[1] == pytest.approx(float(np.mean(ys)), abs=0.004)
 
 
+def test_highest_face_center_recentres_a_face_clipped_by_the_pad():
+    """
+    The pad hides the near half of the top face at the look pose.
+
+    Only the far strip is visible. Its mean sits 15 mm towards the camera;
+    anchoring on the far edge must recover the real square's centre.
+    """
+    xs = np.linspace(0.420, 0.470, 21)
+    ys = np.linspace(-0.025, -0.005, 11)  # far half; the near half is hidden
+    strip = np.array([[x, y, 0.275] for x in xs for y in ys])
+    centre = highest_face_center(
+        strip, closing_axis=(0.0, 1.0, 0.0), size=0.05,
+        viewer=(0.45, 0.05, 0.45))
+    assert centre is not None
+    assert centre[1] == pytest.approx(0.0, abs=1e-9)
+    assert centre[0] == pytest.approx(0.445, abs=1e-9)
+    assert centre[2] == pytest.approx(0.275, abs=1e-9)
+    # Without the corrective arguments the old, biased mean is still what
+    # the search flow gets.
+    plain = highest_face_center(strip)
+    assert plain[1] == pytest.approx(-0.015, abs=1e-9)
+
+
+def test_highest_face_center_recentres_from_either_viewer_side():
+    """The far edge is chosen by the viewer's side, not hard-coded."""
+    xs = np.linspace(0.420, 0.470, 21)
+    ys = np.linspace(0.005, 0.025, 11)  # far half for a viewer at -y
+    strip = np.array([[x, y, 0.275] for x in xs for y in ys])
+    centre = highest_face_center(
+        strip, closing_axis=(0.0, 1.0, 0.0), size=0.05,
+        viewer=(0.45, -0.05, 0.45))
+    assert centre[1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_highest_face_center_keeps_the_mean_for_a_full_face():
+    """A complete (or yawed) face keeps the plain mean, uneven density and all."""
+    xs = np.linspace(0.420, 0.470, 21)
+    ys = np.linspace(-0.025, 0.025, 41)
+    face = np.array([[x, y, 0.275] for x in xs for y in ys])
+    # Overweight one edge; the mean must be the plain mean, not the anchor.
+    dense = np.vstack([face, np.tile([0.445, 0.025, 0.275], (30, 1))])
+    plain = highest_face_center(dense)
+    corrected = highest_face_center(
+        dense, closing_axis=(0.0, 1.0, 0.0), size=0.05,
+        viewer=(0.45, 0.05, 0.45))
+    assert corrected == pytest.approx(plain)
+    assert corrected[1] > 0.0  # the overweighted edge still pulls the mean
+
+
 def test_highest_face_center_needs_enough_points():
     """A handful of stray pixels must not become a grasp target."""
     points = np.array([[0.0, 0.0, 0.04]] * 3)
