@@ -10,6 +10,7 @@ from moveit_msgs.msg import MoveItErrorCodes
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
+from std_msgs.msg import Float64MultiArray
 
 from my_robot_sim.grasp_box import load_config
 from my_robot_sim.mobile_manipulation_node import (
@@ -51,6 +52,7 @@ from my_robot_sim.mobile_manipulation_node import (
     make_open_effort_command,
     make_pose,
     make_reach_goal,
+    make_release_command,
     make_removed_object,
     make_stop_twist,
     make_switch_request,
@@ -522,6 +524,40 @@ def test_attach_command_accepts_explicit_entities():
     """The command format is 'attach <parent> <link> <child> <link>'."""
     assert make_attach_command(
         'robot', 'tool', 'cube', 'body') == 'attach robot tool cube body'
+
+
+def test_release_command_stops_pressing_both_fingers():
+    """The weld, not the 10 N squeeze, carries the cube after the attach."""
+    message = make_release_command()
+    assert isinstance(message, Float64MultiArray)
+    assert len(message.data) == len(HAND_JOINTS) == 2
+    assert list(message.data) == [0.0, 0.0]
+
+
+def test_both_grasp_sequences_release_the_squeeze_before_lifting():
+    """
+    Keeping 10 N on an already welded cube makes the finger chatter.
+
+    Measured live: with the cube welded to the hand the effort press drives
+    the pad into the rigid cube and the stiff contact bounces it back out, so
+    the finger alternates between 0.0179 m and 0.0240 m at the control rate.
+    The wrist camera shows that as the white pad jumping left and right at the
+    cube's edge. Both run() sequences must stop the press after the weld and
+    before the lift.
+    """
+    lift_markers = {
+        'mobile_manipulation_node.py': '第九步：垂直向上抬起',
+        'visual_grasp.py': 'lift = lifted_position(grasp',
+    }
+    for module, lift_marker in lift_markers.items():
+        path = os.path.join(
+            os.path.dirname(__file__), '..', 'my_robot_sim', module)
+        with open(path, encoding='utf-8') as handle:
+            source = handle.read()
+        attach = source.index('if not self.attach_box_in_gazebo():')
+        release = source.index('self.release_grip()')
+        lift = source.index(lift_marker)
+        assert attach < release < lift, module
 
 
 def test_has_all_joints_requires_every_arm_joint():

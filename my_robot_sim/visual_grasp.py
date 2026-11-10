@@ -869,6 +869,9 @@ class VisualGraspNode(MobileManipulationNode):
             self.get_logger().error('抬起方块失败：方块没有固定到夹爪上')
             return False
         self.publish_attached_object(make_attached_object(box_object))
+        # The weld carries the cube from here on; keep the 10 N press and the
+        # pads chatter against the rigid cube (visible in the wrist camera).
+        self.release_grip()
 
         lift = lifted_position(grasp, self.grasp['lift_height'])
         self.get_logger().info(

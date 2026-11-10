@@ -175,6 +175,10 @@ PRE_CLOSE_MARGIN = 0.004  # m between the nearest pad and the cube face
 # when it needs more time.
 SQUEEZE_TIMEOUT = 5.0  # s
 SQUEEZE_CONTACT_TOLERANCE = 0.003  # m; pads must rest on the cube faces
+# How long to let the pads settle after the weld releases the squeeze. The
+# effort controller keeps its last command, so without this the 10 N press
+# keeps driving the pad into the now rigidly attached cube.
+GRIP_RELEASE_SETTLE = 0.2  # s
 
 DRIVE_DISTANCE = 1.0
 FORWARD_SPEED = 0.25
@@ -351,6 +355,23 @@ def make_open_effort_command(effort, joint_count=len(HAND_JOINTS)):
     """Build the command that pushes both fingers against their open stops."""
     message = Float64MultiArray()
     message.data = [abs(float(effort))] * joint_count
+    return message
+
+
+def make_release_command(joint_count=len(HAND_JOINTS)):
+    """
+    Build the zero-effort command that stops the squeeze after the weld.
+
+    The effort controller holds its last command indefinitely. Once the cube
+    is welded to the hand it can no longer yield, so keeping 10 N on the pads
+    over-constrains the contact: the stiff pad bounces out again and the finger
+    chatters between the pressed and the free pose at the control rate
+    (measured in Gazebo: 0.0179 <-> 0.0240 m, i.e. 6 mm). The wrist camera
+    aliases that to a white pad jumping left and right at the cube's edge.
+    Zero effort leaves the pads resting on the cube without the chatter.
+    """
+    message = Float64MultiArray()
+    message.data = [0.0] * joint_count
     return message
 
 
@@ -1142,6 +1163,23 @@ class MobileManipulationNode(Node):
                finger_gap(positions), size, detail))
         return False
 
+    def release_grip(self, settle=GRIP_RELEASE_SETTLE):
+        """
+        Stop squeezing once the cube is welded to the hand.
+
+        The weld, not friction, carries the cube from here on, so the press
+        only over-constrains the finger against a rigid body. Zero effort lets
+        the pad rest on the cube, which stops the 6 mm chatter the wrist
+        camera shows and keeps the lift quiet.
+        """
+        command = make_release_command()
+        deadline = time.monotonic() + settle
+        while rclpy.ok() and time.monotonic() < deadline:
+            self.hand_effort_pub.publish(command)
+            rclpy.spin_once(self, timeout_sec=0.02)
+        self.get_logger().info(
+            '方块已由焊点固定，松开夹紧力；夹爪不再对刚性方块施力。')
+
     def drive_forward(self, distance=None):
         """Drive straight until /odom reports ``distance`` metres travelled."""
         if distance is None:
@@ -1306,6 +1344,9 @@ class MobileManipulationNode(Node):
             return False
         # MoveIt/RViz carry the cube through the attached collision object.
         self.publish_attached_object(make_attached_object(box_object))
+        # The weld now carries the cube: stop pressing before the lift, or
+        # the effort controller chatters the pads against the rigid cube.
+        self.release_grip()
 
         self.get_logger().info(
             '第九步：垂直向上抬起 %.0f cm，手的目标为 '
