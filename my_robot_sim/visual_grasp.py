@@ -857,7 +857,7 @@ class VisualGraspNode(MobileManipulationNode):
             '第八步：预闭合夹爪到 %.3f m，再用 %.1f N 的力夹紧 %.2f m 的方块 ...'
             % (pre_close, self.grasp['squeeze_effort'], size))
         self.publish_collision_objects([make_removed_object(BOX_OBJECT_ID)])
-        if not self.send_move_goal(make_gripper_goal(pre_close)):
+        if not self.pre_close_gripper(pre_close):
             self.get_logger().error('预闭合夹爪失败')
             return False
         if not self.squeeze_gripper():

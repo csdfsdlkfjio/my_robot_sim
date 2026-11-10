@@ -25,6 +25,7 @@ from my_robot_sim.mobile_manipulation_node import (
     FORWARD_SPEED,
     GAZEBO_HAND_LINK,
     GRIPPER_DOWN,
+    GRIPPER_GOAL_TOLERANCE,
     GRIPPER_OPEN,
     GROUND_TRUTH_TOPIC,
     HAND_GROUP,
@@ -39,6 +40,7 @@ from my_robot_sim.mobile_manipulation_node import (
     cube_diagonal,
     default_grasp_config_path,
     finger_gap,
+    gripper_stuck_open,
     has_all_joints,
     inverse_quaternion,
     make_attach_command,
@@ -437,6 +439,60 @@ def test_gripper_goal_commands_both_fingers_symmetrically():
         c.position
         for c in opened.request.goal_constraints[0].joint_constraints]
     assert positions == [GRIPPER_OPEN, GRIPPER_OPEN]
+
+
+def test_gripper_goal_is_planned_within_a_millimetre():
+    """
+    A loose goal tolerance eats the pre-close margin.
+
+    Measured live: the pre-close asked for 0.031 m and the pads stopped at
+    0.0350 m while MoveIt still reported success, because the goal region was
+    +/- 5 mm wide. The pads then had to travel 13 mm under 10 N, which is an
+    impact on a 50 g cube instead of a squeeze.
+    """
+    assert GRIPPER_GOAL_TOLERANCE <= 0.001
+    goal = make_gripper_goal(0.031)
+    for constraint in goal.request.goal_constraints[0].joint_constraints:
+        assert constraint.tolerance_above == pytest.approx(
+            GRIPPER_GOAL_TOLERANCE)
+        assert constraint.tolerance_below == pytest.approx(
+            GRIPPER_GOAL_TOLERANCE)
+
+
+def test_gripper_stuck_open_separates_a_dead_command_from_the_cube():
+    """
+    (0.0400, 0.0400) after a closing command means the pads never moved.
+
+    The reported failure sampled exactly the open stop for the whole 5 s
+    squeeze; no cube between the pads can do that, because at full open the
+    pads are 0.08 m apart and the cube is 0.05 m wide.
+    """
+    assert gripper_stuck_open((0.0400, 0.0400), 0.031)
+    assert gripper_stuck_open((0.0399, 0.0398), 0.025)
+    # The pads did move towards the target: the cube or something else is
+    # holding them, which is a different diagnosis.
+    assert not gripper_stuck_open((0.0350, 0.0350), 0.031)
+    assert not gripper_stuck_open((0.0, 0.0), 0.025)
+    # A goal within 2 mm of the stop is not judged: there is no travel to lose.
+    assert not gripper_stuck_open((0.0399, 0.0399), 0.0395)
+
+
+def test_both_grasp_sequences_verify_the_pre_close_position():
+    """
+    The pre-close must be read back instead of trusting the goal result.
+
+    A goal can be planned, reported as reached, and still leave the pads at
+    the open stop (measured), so the squeeze would press against a gripper
+    that never closed. Both run() sequences go through the verifying helper.
+    """
+    for module in ('mobile_manipulation_node.py', 'visual_grasp.py'):
+        path = os.path.join(
+            os.path.dirname(__file__), '..', 'my_robot_sim', module)
+        with open(path, encoding='utf-8') as handle:
+            source = handle.read()
+        assert 'if not self.pre_close_gripper(pre_close):' in source, module
+        assert 'self.send_move_goal(make_gripper_goal(pre_close))' \
+            not in source, module
 
 
 def test_finger_gap_adds_both_pad_displacements():

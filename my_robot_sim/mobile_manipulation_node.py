@@ -168,6 +168,21 @@ PRE_CLOSE_CLEARANCE = 0.012  # m between pad and cube before the force press
 # few millimetres (not a full centimetre) outside the face that the measured
 # lateral offset says is nearest.
 PRE_CLOSE_MARGIN = 0.004  # m between the nearest pad and the cube face
+# MoveIt plans the gripper goal inside this joint tolerance. It used to be
+# 5 mm, and the measured result was pads at 0.0350 m for a 0.031 m goal: the
+# error ate the whole PRE_CLOSE_MARGIN and nearly doubled the press travel, so
+# the 10 N landed on the 50 g cube as an impact instead of seating on it.
+GRIPPER_GOAL_TOLERANCE = 0.001  # m
+# Let the joint states catch up with an executed pre-close before reading them.
+PRE_CLOSE_SETTLE = 0.2  # s
+# Readback error above this is logged: it becomes the length of the force
+# press that follows, so it is worth seeing in the log.
+PRE_CLOSE_VERIFY_TOLERANCE = 0.002  # m
+# How many times to re-send a pre-close that left the pads on the open stop.
+PRE_CLOSE_ATTEMPTS = 2
+# A pre-close only counts as "did not move" when it asked for this much travel
+# away from the open stop.
+PRE_CLOSE_MIN_TRAVEL = 0.002  # m
 # How long to keep pressing with the effort controller. The fingers can take
 # longer than the old fixed 0.8 s when the cube sits slightly off-centre:
 # one pad reaches it first and pushes it towards the other. Polling the joint
@@ -297,6 +312,23 @@ def finger_gap(positions):
     so the pads' inner faces are ``sum(positions)`` apart.
     """
     return float(positions[0]) + float(positions[1])
+
+
+def gripper_stuck_open(positions, target,
+                       tolerance=GRIPPER_OPEN_TOLERANCE,
+                       min_travel=PRE_CLOSE_MIN_TRAVEL):
+    """
+    True when a closing command left both pads against the open stop.
+
+    ``target`` is the finger value the command asked for. A goal that is
+    planned but never applied leaves the pads at 0.04 m (measured: a whole
+    squeeze reported (0.0400, 0.0400) m), so this separates a dead command
+    path from a cube that actually stopped the fingers. Targets within
+    ``min_travel`` of the stop are not judged: the pads have not been asked
+    to move far enough for the difference to mean anything.
+    """
+    return (min(positions) >= GRIPPER_OPEN - float(tolerance)
+            and float(target) <= GRIPPER_OPEN - float(min_travel))
 
 
 def pads_hold_a_cube(positions, size, tolerance=SQUEEZE_CONTACT_TOLERANCE):
@@ -587,7 +619,8 @@ def make_gripper_goal(position):
     """Move both fingers symmetrically to ``position``."""
     constraints = Constraints(
         joint_constraints=make_joint_constraints(
-            HAND_JOINTS, [position, position], tolerance=0.005))
+            HAND_JOINTS, [position, position],
+            tolerance=GRIPPER_GOAL_TOLERANCE))
     return make_move_goal(HAND_GROUP, constraints, attempts=1,
                           planning_time=2.0, velocity=0.5, acceleration=0.5)
 
@@ -1117,6 +1150,51 @@ class MobileManipulationNode(Node):
             % (stage, positions[0], positions[1]))
         return True
 
+    def pre_close_gripper(self, position):
+        """
+        Move the pads to ``position`` and verify where they really stopped.
+
+        The joint states decide, not the goal result: MoveIt plans within
+        GRIPPER_GOAL_TOLERANCE and the hand JTC accepts a 1 cm per-joint goal
+        error, so a reported success can still leave the pads millimetres from
+        the requested value. That gap is press travel (and impact speed) for
+        the force squeeze that follows, so it is measured and logged, and a
+        goal that never moved the pads off the open stop is sent once more.
+        """
+        positions = None
+        for attempt in range(1, PRE_CLOSE_ATTEMPTS + 1):
+            if not self.send_move_goal(make_gripper_goal(position)):
+                return False
+            self._spin_for(PRE_CLOSE_SETTLE)
+            positions = self.finger_positions()
+            if positions is None:
+                self.get_logger().warning(
+                    '预闭合后没有收到夹爪关节状态，无法核对两指位置。')
+                return True
+            if not gripper_stuck_open(positions, position):
+                error = max(abs(value - position) for value in positions)
+                if error > PRE_CLOSE_VERIFY_TOLERANCE:
+                    self.get_logger().warning(
+                        '预闭合后两指停在 (%0.4f, %0.4f) m，与目标 %.4f m '
+                        '相差 %.1f mm；这段距离会由随后的夹紧补上。'
+                        % (positions[0], positions[1], position,
+                           error * 1000.0))
+                else:
+                    self.get_logger().info(
+                        '预闭合后两指停在 (%0.4f, %0.4f) m，与目标一致。'
+                        % (positions[0], positions[1]))
+                return True
+            self.get_logger().warning(
+                '预闭合没有生效：两指仍停在张开限位 (%0.4f, %0.4f) m，'
+                '目标 %.4f m。重新发送预闭合目标（第 %d/%d 次）...'
+                % (positions[0], positions[1], position,
+                   attempt + 1, PRE_CLOSE_ATTEMPTS))
+        self.get_logger().error(
+            '预闭合失败：两指仍停在张开限位 (%0.4f, %0.4f) m，目标 %.4f m。'
+            '夹爪没有执行位置指令，不再继续夹紧，以免对着张开的夹爪空按。'
+            % (positions[0], positions[1], position))
+        return False
+
     def squeeze_gripper(self):
         """Press the cube with a constant force and verify the pads touch it."""
         size = self.grasp['size']
@@ -1328,7 +1406,7 @@ class MobileManipulationNode(Node):
         # cube while it is still a world object. Remove it from the scene
         # first; the attach message below puts it back as an attached body.
         self.publish_collision_objects([make_removed_object(BOX_OBJECT_ID)])
-        if not self.send_move_goal(make_gripper_goal(pre_close)):
+        if not self.pre_close_gripper(pre_close):
             self.get_logger().error('预闭合夹爪失败')
             return False
         if not self.squeeze_gripper():
