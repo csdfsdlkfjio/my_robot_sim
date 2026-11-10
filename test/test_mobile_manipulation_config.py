@@ -160,6 +160,21 @@ def test_launch_spawns_the_cube_after_the_pedestal():
     assert 'on_exit=[box_spawner]' in source
 
 
+def test_launch_waits_for_gazebo_before_spawning():
+    """spawn_entity.py gives up after 30 s; a cold gzserver can be slower."""
+    with open(LAUNCH, encoding='utf-8') as handle:
+        source = handle.read()
+    start = source.index('spawn_entities = TimerAction(')
+    block = source[start:source.index(')', start)]
+    assert 'period=5.0' in block
+    # Both the robot and the pedestal must wait: the box spawn is chained on
+    # the pedestal spawner, so a late pedestal delays the whole grasp demo.
+    assert 'spawn_entity' in block
+    assert 'pedestal_spawner' in block
+    # The timer itself has to be part of the launched description.
+    assert '        spawn_entities,' in source
+
+
 def test_launch_loads_the_effort_controller_inactive():
     """switch_controller can only activate a controller that is loaded."""
     with open(LAUNCH, encoding='utf-8') as handle:

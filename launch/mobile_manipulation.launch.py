@@ -182,6 +182,17 @@ def generate_launch_description():
             on_exit=[box_spawner],
         ))
 
+    # spawn_entity.py only waits 30 s for /spawn_entity to be advertised.
+    # On a cold WSL2 start gzserver can need longer than that to load the
+    # world (and to give up on the online model database), so every spawner
+    # starts, times out with "Service /spawn_entity unavailable", and leaves
+    # the robot and pedestal unspawned. Give Gazebo a five-second head start
+    # before the spawners begin their own wait.
+    spawn_entities = TimerAction(
+        period=5.0,
+        actions=[spawn_entity, pedestal_spawner],
+    )
+
     # gazebo_ros2_control creates /controller_manager inside gzserver. The
     # spawners wait for that service, so the timer only avoids noisy retries.
     controller_spawners = [
@@ -267,8 +278,7 @@ def generate_launch_description():
         gzserver,
         gzclient,
         robot_state_publisher,
-        spawn_entity,
-        pedestal_spawner,
+        spawn_entities,
         spawn_box_after_pedestal,
         TimerAction(period=3.0, actions=controller_spawners),
         move_group,
