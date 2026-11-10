@@ -232,22 +232,23 @@ ros2 launch my_robot_sim nav2.launch.py params_file:=/绝对路径/nav2_params.y
 `my_robot_sim/search_and_grasp.py` 是移动操作的总控状态机，直接复用已经验证过的 `visual_grasp` 流程：
 
 1. **搜索**：腕部相机移到前视位姿，底盘原地每步转 30°，共 12 步（360°）；每一步做红色分割 + 顶面反投影，得到方块在 `panda_link0` 下的点，再用 TF 换到 `map`。
-2. **导航**：调用 Nav2 的 `NavigateToPose`，走到离方块 `standoff`（默认 0.50 m）的位置，并转身面对方块。0.5 m 是 Panda 从 `panda_link0` 算起的可抓距离；1 m 会超出约 0.85 m 的臂展。
+2. **导航**：调用 Nav2 的 `NavigateToPose`，走到离方块 `standoff`（默认 0.50 m）的位置，并转身面对方块。0.5 m 是 Panda 从 `panda_link0` 算起的可抓距离；1 m 会超出约 0.85 m 的臂展。发送目标前会用 `map_server` 的栅格检查目标点：目标格及其周围 0.25 m（车体外接半径 + 余量）必须全是自由空间，否则拒绝发送并报错，避免视觉定位异常时把目标点算到墙里或地图外。
 3. **抓取**：底盘停稳后执行 `grasp_after_arrival()`（视觉测量 → 预抓取 → 下探 → 预闭合 → 10 N 夹紧 → 焊点固定 → 抬升 10 cm）。腕部相机装在手指上方，观察位姿下手指会挡住顶面靠近相机的一半；顶面点云改为从远离相机的那条真实棱边重建中心（见 `highest_face_center`），实测测量误差从 17 mm 降到 1 mm 左右。
 4. **重试**：视觉测量或抓取失败时，后退 20 cm，再让 Nav2 重新开到方块前的 standoff 位置重试（默认 2 次）。后退后的距离上腕部相机只能看到方块的窄边，直接重抓不可靠。
 
-**前提**：`mobile_manipulation.launch.py`（Gazebo + 机械臂 + 相机）和 `nav2.launch.py` 都已在跑，且 AMCL 已定位（本仓库地图的初值已在参数里设好）。完整步骤：
+**前提**：`mobile_manipulation.launch.py`（Gazebo + 机械臂 + 相机）和 `nav2.launch.py` 都已在跑，且 AMCL 已定位（本仓库地图的初值已在参数里设好）。`mobile_manipulation.launch.py` 默认加载 `worlds/demo.world`：8×8 m 的封闭房间，四面墙（0.1 m 厚、1 m 高，四角互相搭接），底盘开不出去。要换回 Gazebo 空世界可以传 `world:=$(ros2 pkg prefix --share gazebo_ros)/worlds/empty.world`，但那里没有墙，不要用来跑导航。完整步骤：
 
 ```bash
 source ~/ros2_ws/install/setup.bash
-# 终端 1：仿真 + 机械臂
-ros2 launch my_robot_sim mobile_manipulation.launch.py \
-  world:=$(ros2 pkg prefix --share my_robot_sim)/worlds/demo.world
+# 终端 1：仿真 + 机械臂（默认就是带墙的 demo.world）
+ros2 launch my_robot_sim mobile_manipulation.launch.py
 # 终端 2：Nav2（地图和初值都用仓库配置）
 ros2 launch my_robot_sim nav2.launch.py
 # 终端 3：总控
 ros2 run my_robot_sim search_and_grasp
 ```
+
+地图与墙壁的对齐关系：`maps/my_map.yaml` 的 174×174 栅格覆盖 `[-4.35, 4.35]`；墙内表面在 `±3.95`、外表面在 `±4.05`，在栅格里正好各占两列/两行，墙外 0.3 m 是 unknown。`test/test_map_assets.py` 会逐条检查这层对齐关系。
 
 如果启动 Nav2 时机器人不在世界原点，或者换了地图，给总控节点传初值：
 

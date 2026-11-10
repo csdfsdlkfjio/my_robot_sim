@@ -5,7 +5,9 @@ Stages:
     1. search   - aim the wrist camera forward and turn the base in place a
                   full turn, stopping at the first red blob;
     2. navigate - send the cube's map position minus a standoff distance to
-                  Nav2's NavigateToPose action and wait for the base;
+                  Nav2's NavigateToPose action and wait for the base. The
+                  goal is checked against map_server's grid first and refused
+                  when it falls in a wall, an obstacle or off the map;
     3. grasp    - run the visual-grasp sequence (VisualGraspNode) on the
                   settled base;
     4. retry    - back away 20 cm, drive back to the standoff and run the
@@ -19,8 +21,8 @@ all come back as obstacles. The wrist camera is the sensor that both sees the
 small cube and knows its colour.
 
 Usage:
-    world=$(ros2 pkg prefix --share my_robot_sim)/worlds/demo.world
-    ros2 launch my_robot_sim mobile_manipulation.launch.py world:=$world
+    # mobile_manipulation.launch.py defaults to the enclosed demo.world room
+    ros2 launch my_robot_sim mobile_manipulation.launch.py
     ros2 launch my_robot_sim nav2.launch.py
     # config/nav2_params.yaml already gives AMCL the map's initial pose.
     # If the robot has moved, pass initial_x / initial_y / initial_yaw with
@@ -48,7 +50,9 @@ from geometry_msgs.msg import (
     Twist,
 )
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from tf2_ros import TransformException
 
 from my_robot_sim.mobile_manipulation_node import (
@@ -95,6 +99,14 @@ STANDOFF_DISTANCE = 0.5  # m
 NAV_START_TIMEOUT = 30.0  # s for the goal to be accepted
 NAV_TIMEOUT = 180.0  # s for the goal to finish
 NAV_FEEDBACK_PERIOD = 3.0  # s between distance logs
+
+# The standoff point comes from a vision estimate. If that estimate is wrong
+# the point can fall outside the room, and Nav2 would plan into the wall or
+# off the map. Check the goal against map_server's own grid before sending
+# it: the goal cell and everything within this clearance must be free.
+MAP_TOPIC = '/map'
+NAV_GOAL_CLEARANCE = 0.25  # m; the robot's footprint radius plus a margin
+OCCUPIED_THRESHOLD = 65  # percent, equal to my_map.yaml's occupied_thresh
 
 # AMCL has to publish map -> base_link before a map-frame goal means anything.
 MAP_WAIT_TIMEOUT = 30.0  # s
@@ -174,6 +186,55 @@ def standoff_goal(cube_xy, robot_xy, standoff=STANDOFF_DISTANCE):
     return goal_x, goal_y, yaw
 
 
+def map_cell(x, y, origin_x, origin_y, resolution, width, height):
+    """
+    Return the (column, row) map cell of a point, or None when outside.
+
+    Follows map_server's convention: the origin is the lower-left corner of
+    the bottom-left cell and rows are numbered upwards, while the PGM image
+    itself is stored top-down.
+    """
+    resolution = float(resolution)
+    if resolution <= 0.0:
+        return None
+    # The epsilon keeps exact cell boundaries (0.0 with origin -4.35 and a
+    # 0.05 m cell) from falling one cell low through binary rounding.
+    col = int(math.floor(
+        (float(x) - float(origin_x)) / resolution + 1e-9))
+    row = int(math.floor(
+        (float(y) - float(origin_y)) / resolution + 1e-9))
+    if col < 0 or row < 0 or col >= int(width) or row >= int(height):
+        return None
+    return col, row
+
+
+def clearance_violation(data, width, height, col, row, clearance_cells):
+    """
+    Reason the cell is not a usable goal, or None when it and its margin are free.
+
+    ``data`` is OccupancyGrid.data: row-major from the origin corner, -1 for
+    unknown and 0..100 for occupancy. A square margin rather than a disc is
+    deliberately conservative; the demo room leaves metres around the goal.
+    """
+    width = int(width)
+    height = int(height)
+    radius = max(0, int(clearance_cells))
+    for row_offset in range(-radius, radius + 1):
+        other_row = row + row_offset
+        if other_row < 0 or other_row >= height:
+            return '离地图边界不足'
+        for col_offset in range(-radius, radius + 1):
+            other_col = col + col_offset
+            if other_col < 0 or other_col >= width:
+                return '离地图边界不足'
+            value = data[other_row * width + other_col]
+            if value < 0:
+                return '附近是未知区域'
+            if value >= OCCUPIED_THRESHOLD:
+                return '附近有墙壁或障碍物'
+    return None
+
+
 def make_navigate_goal(x, y, yaw, frame_id=MAP_FRAME):
     """
     Nav2 NavigateToPose goal at (x, y, yaw) in ``frame_id``.
@@ -216,6 +277,16 @@ class SearchAndGraspNode(VisualGraspNode):
             PoseWithCovarianceStamped, 'initialpose', 10)
         self.last_nav_feedback = 0.0
         self.map_transform = None
+        self.map_msg = None
+        # map_server publishes its grid once, latched; a subscriber that
+        # starts later only receives it with transient-local durability.
+        map_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.create_subscription(
+            OccupancyGrid, MAP_TOPIC, self._on_map, map_qos)
 
     # ---------------------------------------------------------------- maps
     def lookup_map_transform(self, timeout=TF_TIMEOUT):
@@ -228,6 +299,36 @@ class SearchAndGraspNode(VisualGraspNode):
             except TransformException:
                 rclpy.spin_once(self, timeout_sec=0.1)
         return None
+
+    def _on_map(self, message):
+        """Cache map_server's grid for the navigation goal check."""
+        self.map_msg = message
+
+    def wait_for_occupancy_map(self, timeout=MAP_WAIT_TIMEOUT):
+        """Wait for map_server's latched grid, not just the map TF."""
+        deadline = time.monotonic() + timeout
+        while rclpy.ok() and time.monotonic() < deadline:
+            if self.map_msg is not None:
+                return True
+            rclpy.spin_once(self, timeout_sec=0.1)
+        return self.map_msg is not None
+
+    def goal_is_free(self, x, y):
+        """Check that (x, y) is free with room for the robot's foot print."""
+        if self.map_msg is None:
+            return False, '没有收到 %s' % MAP_TOPIC
+        info = self.map_msg.info
+        cell = map_cell(x, y, info.origin.position.x,
+                        info.origin.position.y, info.resolution,
+                        info.width, info.height)
+        if cell is None:
+            return False, '在地图（墙壁）边界之外'
+        clearance_cells = int(math.ceil(
+            NAV_GOAL_CLEARANCE / float(info.resolution)))
+        reason = clearance_violation(
+            self.map_msg.data, info.width, info.height,
+            cell[0], cell[1], clearance_cells)
+        return reason is None, reason or ''
 
     def wait_for_map(self, timeout=MAP_WAIT_TIMEOUT):
         """
@@ -437,6 +538,17 @@ class SearchAndGraspNode(VisualGraspNode):
             '目标停在离方块 %.2f m 的 (%0.2f, %0.2f)，朝向 %.0f° ...'
             % (cube_xy[0], cube_xy[1], robot_xy[0], robot_xy[1],
                self.standoff, goal_x, goal_y, math.degrees(yaw)))
+        if not self.wait_for_occupancy_map():
+            self.get_logger().error(
+                '没有收到 %s，无法确认目标在墙内，不发送导航目标'
+                % MAP_TOPIC)
+            return False
+        free, reason = self.goal_is_free(goal_x, goal_y)
+        if not free:
+            self.get_logger().error(
+                '导航目标 (%0.2f, %0.2f) 不可用：%s。已拒绝发送，'
+                '避免底盘撞墙或开出房间。' % (goal_x, goal_y, reason))
+            return False
         if not self.send_nav_goal(goal_x, goal_y, yaw):
             return False
         self.stop_and_settle()

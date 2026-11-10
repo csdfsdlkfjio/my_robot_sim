@@ -10,14 +10,17 @@ from nav_msgs.msg import Odometry
 from my_robot_sim.search_and_grasp import (
     GRASP_ATTEMPTS,
     MAP_FRAME,
+    NAV_GOAL_CLEARANCE,
     RETREAT_DISTANCE,
     SEARCH_CAMERA_TILT,
     SEARCH_STEP_ANGLE,
     SEARCH_STEPS,
     STANDOFF_DISTANCE,
     SearchAndGraspNode,
+    clearance_violation,
     make_navigate_goal,
     make_turn_twist,
+    map_cell,
     odom_yaw,
     quaternion_yaw,
     search_camera_quaternion,
@@ -200,3 +203,50 @@ def test_search_uses_the_camera_not_the_lidar():
     assert 'LaserScan' not in source
     assert "'/scan'" not in source
     assert 'detect_once' in source or 'wait_for_detection' in source
+
+
+def test_map_cell_converts_world_points_to_grid_indices():
+    """map_server's origin is the lower-left corner of the bottom-left cell."""
+    assert map_cell(0.0, 0.0, -4.35, -4.35, 0.05, 174, 174) == (87, 87)
+    assert map_cell(3.95, 0.0, -4.35, -4.35, 0.05, 174, 174) == (166, 87)
+    assert map_cell(-4.35, -4.35, -4.35, -4.35, 0.05, 174, 174) == (0, 0)
+
+
+def test_map_cell_rejects_points_outside_the_map():
+    """A goal off the map must be rejected, not indexed into the grid."""
+    assert map_cell(4.40, 0.0, -4.35, -4.35, 0.05, 174, 174) is None
+    assert map_cell(0.0, -4.40, -4.35, -4.35, 0.05, 174, 174) is None
+    assert map_cell(0.0, 0.0, -4.35, -4.35, 0.0, 174, 174) is None
+
+
+def test_clearance_violation_rejects_walls_obstacles_and_unknown():
+    """The standoff must keep the robot's foot print out of everything solid."""
+    width = height = 20
+    free = [0] * (width * height)
+    assert clearance_violation(free, width, height, 10, 10, 2) is None
+    wall = list(free)
+    wall[12 * width + 12] = 100
+    assert clearance_violation(wall, width, height, 10, 10, 2) is not None
+    unknown = list(free)
+    unknown[8 * width + 8] = -1
+    assert clearance_violation(unknown, width, height, 10, 10, 2) is not None
+    # One cell from the edge: the 2-cell margin leaves the grid.
+    assert clearance_violation(free, width, height, 1, 1, 2) is not None
+
+
+def test_navigation_refuses_a_goal_outside_the_free_map():
+    """
+    The standoff comes from a vision estimate and can land in a wall.
+
+    navigate_to_cube must validate it against map_server's grid before the
+    goal is sent, otherwise a bad estimate drives the base into the wall.
+    """
+    assert NAV_GOAL_CLEARANCE > 0.0
+    with open(MODULE, encoding='utf-8') as handle:
+        source = handle.read()
+    navigate = source[
+        source.index('    def navigate_to_cube'):
+        source.index('    def retreat')]
+    assert 'self.wait_for_occupancy_map()' in navigate
+    assert 'goal_is_free' in navigate
+    assert navigate.index('goal_is_free') < navigate.index('send_nav_goal')
