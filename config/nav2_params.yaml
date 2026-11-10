@@ -163,8 +163,17 @@ controller_server:
       # 和近距离复检都会失败（实测一次抓取因此把底盘顶退了 22 cm）。
       # 0.05 m 对应 standoff 0.50 m ± 5 cm，仍在视觉抓取的 0.45-0.55 m
       # 工作范围内。
+      #
+      # 位置不能放宽到 0.15 m：腕部相机在观察位姿下几乎垂直向下，方块
+      # 顶面离镜头约 14.5 cm，60° 视场只覆盖约 ±8 cm，底盘偏 15 cm 就会
+      # 把方块移出画面。前几次“到点不返回 SUCCEEDED”的日志里剩余距离
+      # 已经到过 0.00 m，卡住的是姿态：0.10 rad（5.7°）对这台没有刹车、
+      # 靠轮子摩擦停住的底盘太紧。抓取时机械臂会按实际底盘朝向重新对齐
+      # 夹爪，0.25 rad（14°）以内的朝向误差不影响抓取，所以放宽姿态、
+      # 位置保持 0.05 m；万一仍振荡，search_and_grasp 会在 20 s 后取消
+      # 导航并用腕部相机对准方块的估计位置（见 NAV_NEAR_GOAL_TIMEOUT）。
       xy_goal_tolerance: 0.05
-      yaw_goal_tolerance: 0.10
+      yaw_goal_tolerance: 0.25
     # DWB parameters
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"

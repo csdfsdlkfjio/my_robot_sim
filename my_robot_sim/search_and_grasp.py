@@ -7,7 +7,9 @@ Stages:
     2. navigate - send the cube's map position minus a standoff distance to
                   Nav2's NavigateToPose action and wait for the base. The
                   goal is checked against map_server's grid first and refused
-                  when it falls in a wall, an obstacle or off the map;
+                  when it falls in a wall, an obstacle or off the map. If the
+                  base circles the goal for 20 s without SUCCEEDED, cancel
+                  and re-aim the wrist camera at the cube estimate;
     3. grasp    - run the visual-grasp sequence (VisualGraspNode) on the
                   settled base;
     4. retry    - back away 20 cm, drive back to the standoff and run the
@@ -64,6 +66,7 @@ from my_robot_sim.mobile_manipulation_node import (
     make_reach_goal,
     odom_distance,
     odom_xy,
+    point_in_world,
 )
 from my_robot_sim.visual_grasp import (
     VisualGraspNode,
@@ -97,8 +100,22 @@ SEARCH_SETTLE_AFTER_LOOK = 0.3  # s, lets the arm stop before the first look
 # out of reach.
 STANDOFF_DISTANCE = 0.5  # m
 NAV_START_TIMEOUT = 30.0  # s for the goal to be accepted
-NAV_TIMEOUT = 180.0  # s for the goal to finish
+NAV_TIMEOUT = 180.0  # s hard cap for the goal to finish
 NAV_FEEDBACK_PERIOD = 3.0  # s between distance logs
+# Nav2 can circle the last few centimetres without ever reporting SUCCEEDED:
+# the feedback only exposes the translational error, so a base sitting at
+# "0.00 m remaining" but not yaw-aligned looks stuck. When the error has
+# stayed inside NAV_NEAR_GOAL_DISTANCE for NAV_NEAR_GOAL_TIMEOUT seconds,
+# cancel the goal, stop, and let the wrist camera finish from there.
+NAV_NEAR_GOAL_DISTANCE = 0.20  # m
+NAV_NEAR_GOAL_TIMEOUT = 20.0  # s
+# The fallback grasp aims the wrist camera at the cube's estimated position
+# instead of the fixed look pose, so the base does not have to stop exactly
+# on the standoff. These bounds keep that aim inside the Panda's reach from
+# panda_link0 (0.85 m) with room for the approach.
+GRASP_REACH_MIN = 0.30  # m ahead of the arm base
+GRASP_REACH_MAX = 0.70  # m
+GRASP_LATERAL_MAX = 0.25  # m to either side
 
 # The standoff point comes from a vision estimate. If that estimate is wrong
 # the point can fall outside the room, and Nav2 would plan into the wall or
@@ -184,6 +201,24 @@ def standoff_goal(cube_xy, robot_xy, standoff=STANDOFF_DISTANCE):
     yaw = math.atan2(float(cube_xy[1]) - goal_y,
                      float(cube_xy[0]) - goal_x)
     return goal_x, goal_y, yaw
+
+
+def fallback_look_position(cube_in_arm, look_z):
+    """
+    Look pose directly above a cube estimate, or None when it is unreachable.
+
+    Used when Nav2 stopped short of the standoff: the cube can then sit
+    several centimetres away from the fixed look pose, and the wrist camera's
+    downward view only covers about +/-8 cm there. Aiming at the estimate
+    lets the normal visual measurement take over instead of failing blind.
+    """
+    x = float(cube_in_arm[0])
+    y = float(cube_in_arm[1])
+    if not GRASP_REACH_MIN <= x <= GRASP_REACH_MAX:
+        return None
+    if abs(y) > GRASP_LATERAL_MAX:
+        return None
+    return (x, y, float(look_z))
 
 
 def map_cell(x, y, origin_x, origin_y, resolution, width, height):
@@ -276,6 +311,12 @@ class SearchAndGraspNode(VisualGraspNode):
         self.initial_pose_pub = self.create_publisher(
             PoseWithCovarianceStamped, 'initialpose', 10)
         self.last_nav_feedback = 0.0
+        self.nav_distance_remaining = None
+        self.nav_near_since = None
+        # Cube's top-face point in the ground-truth world frame. Unlike the
+        # map estimate it does not inherit AMCL's drift, so it is the better
+        # aim point when Nav2 stopped off the standoff.
+        self.cube_world = None
         self.map_transform = None
         self.map_msg = None
         # map_server publishes its grid once, latched; a subscriber that
@@ -456,6 +497,12 @@ class SearchAndGraspNode(VisualGraspNode):
                     '红色区域距离 %.1f m，太远不像方块，继续搜索' % horizon)
                 continue
 
+            pose = self.base_pose()
+            if pose is not None:
+                # Keep a map-independent copy: the fallback grasp aim must
+                # not inherit the AMCL error that made Nav2 stop short.
+                self.cube_world = point_in_world(point, pose)
+
             transform = self.lookup_map_transform()
             if transform is None:
                 self.get_logger().error('没有 map -> %s 的 TF'
@@ -478,23 +525,36 @@ class SearchAndGraspNode(VisualGraspNode):
 
     # ---------------------------------------------------------- navigation
     def _on_nav_feedback(self, feedback):
-        """Log the remaining distance a few times per navigation."""
+        """Track the remaining distance and whether the base is at the goal."""
         now = time.monotonic()
+        distance = float(feedback.feedback.distance_remaining)
+        self.nav_distance_remaining = distance
+        if distance <= NAV_NEAR_GOAL_DISTANCE:
+            if self.nav_near_since is None:
+                self.nav_near_since = now
+        else:
+            # It left the goal area: the 20 s clock starts over.
+            self.nav_near_since = None
         if now - self.last_nav_feedback < NAV_FEEDBACK_PERIOD:
             return
         self.last_nav_feedback = now
-        self.get_logger().info(
-            '导航中：剩余 %.2f m'
-            % float(feedback.feedback.distance_remaining))
+        self.get_logger().info('导航中：剩余 %.2f m' % distance)
 
     def send_nav_goal(self, x, y, yaw, timeout=NAV_TIMEOUT):
-        """Send one NavigateToPose goal and return True when it succeeds."""
+        """
+        Send one NavigateToPose goal.
+
+        Returns 'succeeded' when Nav2 reached the goal, 'near' when the base
+        stayed within NAV_NEAR_GOAL_DISTANCE for NAV_NEAR_GOAL_TIMEOUT
+        seconds without SUCCEEDED and the goal was cancelled, and 'failed'
+        otherwise. In both non-successful cases the base is already stopped.
+        """
         if not self.nav_client.wait_for_server(
                 timeout_sec=NAV_START_TIMEOUT):
             self.get_logger().error(
                 '找不到 Nav2 的 %s Action。先启动 '
                 'ros2 launch my_robot_sim nav2.launch.py' % NAV_ACTION)
-            return False
+            return 'failed'
         goal = make_navigate_goal(x, y, yaw)
         send_future = self.nav_client.send_goal_async(
             goal, feedback_callback=self._on_nav_feedback)
@@ -502,25 +562,94 @@ class SearchAndGraspNode(VisualGraspNode):
             self, send_future, timeout_sec=NAV_START_TIMEOUT)
         if not send_future.done():
             self.get_logger().error('发送导航目标超时')
-            return False
+            return 'failed'
         handle = send_future.result()
         if handle is None or not handle.accepted:
             self.get_logger().error('Nav2 拒绝了导航目标')
-            return False
+            return 'failed'
 
+        self.nav_near_since = None
+        self.nav_distance_remaining = None
         result_future = handle.get_result_async()
-        rclpy.spin_until_future_complete(
-            self, result_future, timeout_sec=timeout)
+        deadline = time.monotonic() + float(timeout)
+        while rclpy.ok() and not result_future.done():
+            now = time.monotonic()
+            if now >= deadline:
+                self.get_logger().error(
+                    '导航 %.0f s 未完成，取消目标' % timeout)
+                handle.cancel_goal_async()
+                self.stop_and_settle()
+                return 'failed'
+            if (self.nav_near_since is not None
+                    and now - self.nav_near_since
+                    >= NAV_NEAR_GOAL_TIMEOUT):
+                self.get_logger().warning(
+                    '底盘已在目标 %.2f m 内停留 %.0f s 仍未 SUCCEEDED，'
+                    '取消导航，改用视觉抓取当前位置 ...'
+                    % (NAV_NEAR_GOAL_DISTANCE, NAV_NEAR_GOAL_TIMEOUT))
+                handle.cancel_goal_async()
+                self.stop_and_settle()
+                return 'near'
+            rclpy.spin_once(self, timeout_sec=0.1)
         if not result_future.done():
-            self.get_logger().error(
-                '导航 %.0f s 未完成，取消目标' % timeout)
+            # rclpy shut down mid-goal; do not leave the base driving.
             handle.cancel_goal_async()
             self.stop_and_settle()
-            return False
+            return 'failed'
+
         status = result_future.result().status
-        if status != GoalStatus.STATUS_SUCCEEDED:
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            return 'succeeded'
+        if status == GoalStatus.STATUS_CANCELED:
+            self.get_logger().error(
+                '导航被取消（CANCELED），底盘没有到达目标')
+        elif status == GoalStatus.STATUS_ABORTED:
+            self.get_logger().error(
+                '导航被中止（ABORTED），Nav2 无法到达目标')
+        else:
             self.get_logger().error('导航失败，Action 状态 %d' % status)
+        return 'failed'
+
+    def aim_at_estimated_cube(self, cube_xy):
+        """
+        Point the wrist camera at the cube from the stopped base.
+
+        Prefers the search-time world point, which comes from ground-truth
+        odometry. The map estimate carries AMCL's drift -- the very error
+        that stopped Nav2 short -- so aiming by map alone can miss the cube
+        by more than the camera's +/-8 cm view.
+        """
+        cube = None
+        source = '地图估计'
+        if self.cube_world is not None and self.base_pose() is not None:
+            point = self.point_in_arm_frame(self.cube_world)
+            cube = (point.x, point.y, point.z)
+            source = '搜索时的世界坐标'
+        if cube is None:
+            transform = self.lookup_map_transform()
+            if transform is None:
+                self.get_logger().error(
+                    '没有 %s -> %s 的 TF，无法把相机对准方块'
+                    % (MAP_FRAME, ARM_BASE_FRAME))
+                return False
+            cube = transform_point(
+                transform, (float(cube_xy[0]), float(cube_xy[1]), 0.0))
+        look = fallback_look_position(cube, self.look_position[2])
+        if look is None:
+            self.get_logger().error(
+                '底盘停在离目标较远处，方块在 %s 下为 (%.2f, %.2f)，'
+                '超出可抓范围（x %.2f-%.2f m，|y| <= %.2f m），'
+                '不再盲目抓取。请检查 Nav2 是否能到达 standoff。'
+                % (ARM_BASE_FRAME, cube[0], cube[1], GRASP_REACH_MIN,
+                   GRASP_REACH_MAX, GRASP_LATERAL_MAX))
             return False
+        self.get_logger().warning(
+            '方块当前在 %s 下为 (%.2f, %.2f)（来源：%s），把腕部相机'
+            '观察点从 (%.2f, %.2f, %.2f) 改到 (%.2f, %.2f, %.2f) ...'
+            % (ARM_BASE_FRAME, cube[0], cube[1], source,
+               self.look_position[0], self.look_position[1],
+               self.look_position[2], look[0], look[1], look[2]))
+        self.look_position = look
         return True
 
     def navigate_to_cube(self, cube_xy):
@@ -549,8 +678,17 @@ class SearchAndGraspNode(VisualGraspNode):
                 '导航目标 (%0.2f, %0.2f) 不可用：%s。已拒绝发送，'
                 '避免底盘撞墙或开出房间。' % (goal_x, goal_y, reason))
             return False
-        if not self.send_nav_goal(goal_x, goal_y, yaw):
+        status = self.send_nav_goal(goal_x, goal_y, yaw)
+        if status == 'failed':
             return False
+        if status == 'near':
+            # Nav2 stopped within a few centimetres of the goal but never
+            # reported SUCCEEDED (usually a yaw the base cannot settle on).
+            # The base is stopped; re-aim the camera using the cube estimate
+            # and let the proven visual grasp run.
+            if not self.aim_at_estimated_cube(cube_xy):
+                return False
+            return True
         self.stop_and_settle()
         return True
 

@@ -2,6 +2,7 @@
 
 import os
 
+import pytest
 import yaml
 
 PKG_ROOT = os.path.join(os.path.dirname(__file__), '..')
@@ -45,6 +46,25 @@ def iter_values(node):
 def test_no_base_footprint_value():
     """参数值里不应再出现 base_footprint（注释不算）."""
     assert 'base_footprint' not in list(iter_values(load_params()))
+
+
+def test_goal_checker_keeps_xy_tight_but_relaxes_yaw():
+    """
+    The stuck-at-goal logs showed 0.00 m remaining, so xy was never the issue.
+
+    The wrist camera looks almost straight down and only sees a +/-8 cm patch
+    at the cube top, so xy must stay tight; the base yaw is compensated by
+    the arm, so the 0.10 rad yaw tolerance can be relaxed to stop the
+    end-of-approach oscillation.
+    """
+    server = load_params()['controller_server']['ros__parameters']
+    checker = server['general_goal_checker']
+    assert 0.03 <= checker['xy_goal_tolerance'] <= 0.08
+    assert checker['yaw_goal_tolerance'] >= 0.20
+    # DWB's own goal test must not stop the base before the goal checker
+    # is satisfied.
+    assert server['FollowPath']['xy_goal_tolerance'] == pytest.approx(
+        checker['xy_goal_tolerance'])
 
 
 def test_launch_passes_params_file():
