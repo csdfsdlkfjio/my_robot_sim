@@ -6,6 +6,9 @@ Usage:
     ros2 launch my_robot_sim mobile_manipulation.launch.py \
         gui:=false rviz:=false
 
+The default world is worlds/demo.world: an enclosed 8 x 8 m room with four
+walls, so navigation cannot drive the base off the ground plane.
+
 The launch does NOT start the task node; run it separately:
     ros2 run my_robot_sim mobile_manipulation_node
 """
@@ -80,7 +83,11 @@ def generate_launch_description():
     moveit_config.robot_description['robot_description'] = robot_description
 
     gazebo_share = get_package_share_directory('gazebo_ros')
-    default_world = os.path.join(gazebo_share, 'worlds', 'empty.world')
+    # Default to the enclosed 8 x 8 m room. Gazebo's empty.world has no
+    # walls and only a finite ground plane, so Nav2 can drive the base off
+    # the edge and drop it into the void. Pass
+    # world:=.../empty.world to get the old bare world back.
+    default_world = os.path.join(pkg_share, 'worlds', 'demo.world')
 
     # gzserver resolves a URDF <plugin filename="libgazebo_grasp_attach.so"/>
     # on GAZEBO_PLUGIN_PATH. The grasp weld plugin lives in

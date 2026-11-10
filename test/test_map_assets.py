@@ -1,8 +1,10 @@
 """地图资源与演示世界文件的静态检查."""
 
+import math
 import os
 import xml.etree.ElementTree as ET
 
+import numpy as np
 import yaml
 
 PKG_ROOT = os.path.join(os.path.dirname(__file__), '..')
@@ -56,3 +58,94 @@ def test_demo_world_is_valid_sdf():
     assert len(models) >= 5, '演示世界至少要有四面墙和两个障碍物'
     for model in models:
         assert model.find('link') is not None
+
+
+def read_pgm(path):
+    """读取二进制 PGM（P5），返回高度 x 宽度的灰度数组（第 0 行在顶部）."""
+    with open(path, 'rb') as handle:
+        assert handle.readline().strip() == b'P5'
+        line = handle.readline()
+        while line.startswith(b'#'):
+            line = handle.readline()
+        width, height = (int(value) for value in line.split())
+        assert int(handle.readline()) == 255
+        data = np.frombuffer(handle.read(width * height), dtype=np.uint8)
+    assert data.size == width * height
+    return data.reshape(height, width)
+
+
+def read_walls():
+    """返回 [(名字, x, y, x 尺寸, y 尺寸)]，来自 demo.world 的静态墙体."""
+    root = ET.parse(DEMO_WORLD).getroot()
+    walls = []
+    for model in root.find('world').findall('model'):
+        name = model.get('name', '')
+        if not name.startswith('wall_'):
+            continue
+        x, y = (float(value) for value in
+                model.find('pose').text.split()[:2])
+        size = model.find('.//collision/geometry/box/size').text.split()
+        walls.append((name, x, y, float(size[0]), float(size[1])))
+    return walls
+
+
+def map_pixel(image, info, x, y):
+    """世界坐标 (x, y) 处的 PGM 灰度值."""
+    resolution = info['resolution']
+    col = int(math.floor((x - info['origin'][0]) / resolution + 1e-9))
+    row = int(math.floor((y - info['origin'][1]) / resolution + 1e-9))
+    height, width = image.shape
+    assert 0 <= col < width and 0 <= row < height
+    # PGM 第 0 行在地图上方；map_server 的行号从 origin 角落向上增长。
+    return int(image[height - 1 - row, col])
+
+
+def test_demo_world_walls_form_a_closed_ring():
+    """墙体必须在四角互相搭接，底盘才没有能开出去的缝."""
+    walls = read_walls()
+    assert {wall[0] for wall in walls} == {
+        'wall_north', 'wall_south', 'wall_east', 'wall_west'}
+    by_name = {wall[0]: wall for wall in walls}
+    # 南北墙沿 x 方向长 8.2 m，东西墙沿 y 方向长 8.2 m：两端都越过
+    # +/-4 m 的墙体中心线，四角因此重叠，没有缺口。
+    for name in ('wall_north', 'wall_south'):
+        assert by_name[name][3] / 2.0 > 4.0
+    for name in ('wall_east', 'wall_west'):
+        assert by_name[name][4] / 2.0 > 4.0
+
+
+def test_map_bounds_contain_the_walls_with_unknown_outside():
+    """地图范围必须盖住墙体外沿，墙外留一圈 unknown."""
+    info = load_map_info()
+    width, height = read_pgm_header(
+        os.path.join(os.path.dirname(MAP_YAML), info['image']))
+    resolution = info['resolution']
+    min_x, min_y = info['origin'][0], info['origin'][1]
+    assert min_x <= -4.05 and min_y <= -4.05
+    assert min_x + width * resolution >= 4.05
+    assert min_y + height * resolution >= 4.05
+
+
+def test_map_pixels_align_with_the_demo_world_walls():
+    """
+    墙体在栅格里的位置必须和 demo.world 完全一致.
+
+    墙厚 0.1 m、中心在 +/-4 m：内表面 +/-3.95、外表面 +/-4.05。地图里
+    每条墙的中心线必须是 occupied，墙内 5 cm 是自由空间，墙外是 unknown。
+    """
+    info = load_map_info()
+    image = read_pgm(os.path.join(os.path.dirname(MAP_YAML), info['image']))
+    for x in np.linspace(-3.0, 3.0, 13):
+        assert map_pixel(image, info, x, 4.0) == 0, '北墙没有占到栅格'
+        assert map_pixel(image, info, x, -4.0) == 0, '南墙没有占到栅格'
+        assert map_pixel(image, info, x, 3.90) == 254, '北墙内侧不是自由空间'
+        assert map_pixel(image, info, x, -3.90) == 254, '南墙内侧不是自由空间'
+        assert map_pixel(image, info, x, 4.10) == 205, '北墙外侧不是 unknown'
+        assert map_pixel(image, info, x, -4.10) == 205, '南墙外侧不是 unknown'
+    for y in np.linspace(-3.0, 3.0, 13):
+        assert map_pixel(image, info, 4.0, y) == 0, '东墙没有占到栅格'
+        assert map_pixel(image, info, -4.0, y) == 0, '西墙没有占到栅格'
+        assert map_pixel(image, info, 3.90, y) == 254, '东墙内侧不是自由空间'
+        assert map_pixel(image, info, -3.90, y) == 254, '西墙内侧不是自由空间'
+        assert map_pixel(image, info, 4.10, y) == 205, '东墙外侧不是 unknown'
+        assert map_pixel(image, info, -4.10, y) == 205, '西墙外侧不是 unknown'

@@ -1,11 +1,18 @@
 # Generated from worlds/demo.world's exact geometry, in the Gazebo world
 # frame (the robot spawns at the world origin and /odom starts there).
+# The 174 x 174 grid covers [-4.35, 4.35] in x and y. demo.world's four
+# walls are 0.1 m thick, centred on x/y = +/-4, so their inner faces are at
+# +/-3.95 and their outer faces at +/-4.05. Each wall is exactly two cells
+# wide in this grid (columns/rows 166-167), the room interior is free down to
+# the inner faces, and the 0.30 m strip outside the walls is unknown. The two
+# boxes sit at (1.5, 1.0) and (-1.5, -1.5), so AMCL's correct initial pose is
+# (0, 0, 0) -- see config/nav2_params.yaml. test/test_map_assets.py checks
+# this alignment against demo.world.
+#
 # The previous file was a SLAM trace whose room was rotated ~52 degrees
 # against the world and contained two overlapping wall outlines; AMCL
 # jumped between them during the in-place search and sent Nav2 the wrong
-# way. The walls are at x/y = +/-4 and the two boxes sit at (1.5, 1.0)
-# and (-1.5, -1.5), so with this map AMCL's correct initial pose is
-# (0, 0, 0) -- see config/nav2_params.yaml.
+# way.
 image: my_map.pgm
 mode: trinary
 resolution: 0.05
