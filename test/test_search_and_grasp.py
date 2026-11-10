@@ -239,16 +239,31 @@ def test_map_cell_rejects_points_outside_the_map():
 def test_clearance_violation_rejects_walls_obstacles_and_unknown():
     """The standoff must keep the robot's foot print out of everything solid."""
     width = height = 20
+    resolution = 0.1
     free = [0] * (width * height)
-    assert clearance_violation(free, width, height, 10, 10, 2) is None
+    assert clearance_violation(
+        free, width, height, 0.0, 0.0, resolution, 1.05, 1.05, 0.2) is None
+    # Cell (12, 10) covers x 1.2-1.3, y 1.0-1.1: 0.15 m from the goal.
     wall = list(free)
-    wall[12 * width + 12] = 100
-    assert clearance_violation(wall, width, height, 10, 10, 2) is not None
+    wall[10 * width + 12] = 100
+    assert clearance_violation(
+        wall, width, height, 0.0, 0.0, resolution,
+        1.05, 1.05, 0.2) == '附近有墙壁或障碍物'
     unknown = list(free)
     unknown[8 * width + 8] = -1
-    assert clearance_violation(unknown, width, height, 10, 10, 2) is not None
-    # One cell from the edge: the 2-cell margin leaves the grid.
-    assert clearance_violation(free, width, height, 1, 1, 2) is not None
+    assert clearance_violation(
+        unknown, width, height, 0.0, 0.0, resolution,
+        1.05, 1.05, 0.2) == '附近是未知区域'
+    # 0.15 m from the same wall: a 0.14 m clearance fits, a 0.2 m one does
+    # not. Measuring to the cell rectangle (not its centre) is what lets
+    # lateral goals next to the table pass.
+    assert clearance_violation(
+        wall, width, height, 0.0, 0.0, resolution,
+        1.05, 1.05, 0.14) is None
+    # The clearance disc leaves the grid at the lower-left corner.
+    assert clearance_violation(
+        free, width, height, 0.0, 0.0, resolution,
+        0.15, 0.15, 0.2) == '离地图边界不足'
 
 
 def test_fallback_look_position_aims_above_a_reachable_cube():

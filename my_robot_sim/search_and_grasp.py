@@ -124,10 +124,21 @@ GRASP_LATERAL_MAX = 0.25  # m to either side
 # The standoff point comes from a vision estimate. If that estimate is wrong
 # the point can fall outside the room, and Nav2 would plan into the wall or
 # off the map. Check the goal against map_server's own grid before sending
-# it: the goal cell and everything within this clearance must be free.
+# it: the goal point must be at least this far from every occupied cell.
 MAP_TOPIC = '/map'
-NAV_GOAL_CLEARANCE = 0.25  # m; the robot's footprint radius plus a margin
+# 0.22 m is the footprint radius used by both costmaps; 2 cm on top absorbs
+# the vision estimate's error. The check measures the distance from the goal
+# point to the actual cell rectangles, not to whole-cell centres: the older
+# square-of-cells test over-rejected diagonal goals next to the long table by
+# up to a cell diagonal, which made a cube at y=+/-0.6 m unusable even though
+# the base would have kept 25 cm of real clearance.
+NAV_GOAL_CLEARANCE = 0.24  # m; the robot's footprint radius plus a margin
 OCCUPIED_THRESHOLD = 65  # percent, equal to my_map.yaml's occupied_thresh
+# Extra standoff distances tried when the nominal goal fails the clearance
+# check. A cube at |y| = 0.6 m seen obliquely can be estimated ~10 cm too
+# far east; 5-10 cm of retreat moves the goal off the table while keeping
+# the true cube within the arm's reach.
+NAV_GOAL_RETREAT_STEPS = (0.05, 0.10)
 
 # AMCL has to publish map -> base_link before a map-frame goal means anything.
 MAP_WAIT_TIMEOUT = 30.0  # s
@@ -247,29 +258,51 @@ def map_cell(x, y, origin_x, origin_y, resolution, width, height):
     return col, row
 
 
-def clearance_violation(data, width, height, col, row, clearance_cells):
+def clearance_violation(data, width, height, origin_x, origin_y, resolution,
+                        goal_x, goal_y, clearance):
     """
-    Reason the cell is not a usable goal, or None when it and its margin are free.
+    Reason the point lacks ``clearance`` metres of free space, or None.
 
     ``data`` is OccupancyGrid.data: row-major from the origin corner, -1 for
-    unknown and 0..100 for occupancy. A square margin rather than a disc is
-    deliberately conservative; the demo room leaves metres around the goal.
+    unknown and 0..100 for occupancy. The distance is measured from the goal
+    point to each occupied cell's rectangle, so a goal just outside the
+    clearance still passes regardless of where it falls inside its own cell.
+    Checking whole cells around a rounded goal cell instead over-rejects
+    goals next to long obstacles such as the table by up to a cell diagonal.
     """
     width = int(width)
     height = int(height)
-    radius = max(0, int(clearance_cells))
-    for row_offset in range(-radius, radius + 1):
-        other_row = row + row_offset
-        if other_row < 0 or other_row >= height:
-            return '离地图边界不足'
-        for col_offset in range(-radius, radius + 1):
-            other_col = col + col_offset
-            if other_col < 0 or other_col >= width:
-                return '离地图边界不足'
-            value = data[other_row * width + other_col]
+    resolution = float(resolution)
+    radius = max(0.0, float(clearance))
+    if resolution <= 0.0:
+        return '地图分辨率无效'
+    # Every cell whose rectangle can come within ``radius`` of the goal.
+    col_min = int(math.floor(
+        (float(goal_x) - radius - float(origin_x)) / resolution + 1e-9))
+    col_max = int(math.floor(
+        (float(goal_x) + radius - float(origin_x)) / resolution + 1e-9))
+    row_min = int(math.floor(
+        (float(goal_y) - radius - float(origin_y)) / resolution + 1e-9))
+    row_max = int(math.floor(
+        (float(goal_y) + radius - float(origin_y)) / resolution + 1e-9))
+    if (col_min < 0 or row_min < 0
+            or col_max >= width or row_max >= height):
+        return '离地图边界不足'
+    for row in range(row_min, row_max + 1):
+        cell_min_y = float(origin_y) + row * resolution
+        cell_max_y = cell_min_y + resolution
+        nearest_y = min(max(float(goal_y), cell_min_y), cell_max_y)
+        for col in range(col_min, col_max + 1):
+            value = data[row * width + col]
             if value < 0:
                 return '附近是未知区域'
-            if value >= OCCUPIED_THRESHOLD:
+            if value < OCCUPIED_THRESHOLD:
+                continue
+            cell_min_x = float(origin_x) + col * resolution
+            cell_max_x = cell_min_x + resolution
+            nearest_x = min(max(float(goal_x), cell_min_x), cell_max_x)
+            if math.hypot(float(goal_x) - nearest_x,
+                          float(goal_y) - nearest_y) < radius:
                 return '附近有墙壁或障碍物'
     return None
 
@@ -363,16 +396,10 @@ class SearchAndGraspNode(VisualGraspNode):
         if self.map_msg is None:
             return False, '没有收到 %s' % MAP_TOPIC
         info = self.map_msg.info
-        cell = map_cell(x, y, info.origin.position.x,
-                        info.origin.position.y, info.resolution,
-                        info.width, info.height)
-        if cell is None:
-            return False, '在地图（墙壁）边界之外'
-        clearance_cells = int(math.ceil(
-            NAV_GOAL_CLEARANCE / float(info.resolution)))
         reason = clearance_violation(
             self.map_msg.data, info.width, info.height,
-            cell[0], cell[1], clearance_cells)
+            info.origin.position.x, info.origin.position.y,
+            info.resolution, x, y, NAV_GOAL_CLEARANCE)
         return reason is None, reason or ''
 
     def wait_for_map(self, timeout=MAP_WAIT_TIMEOUT):
@@ -677,6 +704,31 @@ class SearchAndGraspNode(VisualGraspNode):
                 % MAP_TOPIC)
             return False
         free, reason = self.goal_is_free(goal_x, goal_y)
+        if not free:
+            # The search's top-face measurement is range-biased when the
+            # cube is seen obliquely: at y=-0.6 m the estimate came out
+            # 9 cm too far east, which put the 0.6 m standoff inside the
+            # table's clearance band. Back the goal off along the same
+            # cube->robot line (still facing the cube) and retry; the real
+            # cube is then only 0.05-0.10 m farther than the nominal
+            # standoff, inside the arm's reach. The map check runs again
+            # for every candidate, so a retreat into another obstacle is
+            # still refused.
+            for extra in NAV_GOAL_RETREAT_STEPS:
+                candidate_x, candidate_y, candidate_yaw = standoff_goal(
+                    cube_xy, robot_xy, self.standoff + extra)
+                candidate_free, _ = self.goal_is_free(
+                    candidate_x, candidate_y)
+                if candidate_free:
+                    self.get_logger().warning(
+                        '导航目标 (%0.2f, %0.2f) 不可用：%s；沿视线后退 '
+                        '%.2f m，改用 (%0.2f, %0.2f) ...'
+                        % (goal_x, goal_y, reason, extra,
+                           candidate_x, candidate_y))
+                    goal_x, goal_y = candidate_x, candidate_y
+                    yaw = candidate_yaw
+                    free = True
+                    break
         if not free:
             self.get_logger().error(
                 '导航目标 (%0.2f, %0.2f) 不可用：%s。已拒绝发送，'
