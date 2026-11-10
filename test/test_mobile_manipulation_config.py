@@ -142,22 +142,29 @@ def test_launch_starts_gazebo_ros2_control_and_moveit():
         "name='mobile_robot_state_publisher'",
         'grasp_box.yaml',
         'grasp_box',
-        'grasp_pedestal',
         'box_sdf',
-        'pedestal_sdf',
     ):
         assert token in source, 'launch is missing %s' % token
+    # The table is a static model in demo.world, not a launch spawn: SLAM
+    # maps the world without the launch, and a spawned table would be
+    # missing from the map it is meant to be avoided in.
+    assert 'grasp_table' not in source
+    assert 'pedestal_sdf' not in source
     # The ros2_control YAML is referenced from the model's Gazebo plugin,
     # which test_mobile_manipulation_model already checks.
 
 
-def test_launch_spawns_the_cube_after_the_pedestal():
-    """Parallel spawns let the free cube fall through the missing pedestal."""
+def test_launch_spawns_the_cube_on_the_world_table():
+    """The table comes from demo.world; only the cube is spawned."""
     with open(LAUNCH, encoding='utf-8') as handle:
         source = handle.read()
-    assert 'OnProcessExit' in source
-    assert 'target_action=pedestal_spawner' in source
-    assert 'on_exit=[box_spawner]' in source
+    start = source.index('box_spawner = Node(')
+    block = source[start:source.index('TimerAction(', start)]
+    for token in ("'-entity', 'grasp_box'", "'-file', grasp_file"):
+        assert token in block
+    # The initial z must be the table top plus half the cube, otherwise the
+    # cube falls a few centimetres or spawns inside the table.
+    assert "grasp['z']" in block
 
 
 def test_launch_waits_for_gazebo_before_spawning():
@@ -167,10 +174,9 @@ def test_launch_waits_for_gazebo_before_spawning():
     start = source.index('spawn_entities = TimerAction(')
     block = source[start:source.index(')', start)]
     assert 'period=5.0' in block
-    # Both the robot and the pedestal must wait: the box spawn is chained on
-    # the pedestal spawner, so a late pedestal delays the whole grasp demo.
+    # Both the robot and the cube must wait for gzserver.
     assert 'spawn_entity' in block
-    assert 'pedestal_spawner' in block
+    assert 'box_spawner' in block
     # The timer itself has to be part of the launched description.
     assert '        spawn_entities,' in source
 

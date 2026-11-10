@@ -9,7 +9,7 @@ Sequence:
     3. open both gripper fingers with MoveIt;
     4. drive forward ``drive_distance`` metres, checked against /odom;
     5. publish zero velocity and let the base settle;
-    6. put the grasp cube and its pedestal into MoveIt's planning scene at
+    6. put the grasp cube and the long table into MoveIt's planning scene at
        their real pose (RViz shows them, MoveIt avoids them);
     7. MoveIt to 5 cm above the cube's top face, then straight down until the
        grasp point is at the cube centre;
@@ -36,9 +36,9 @@ joint between the cube and panda_hand once the fingers are closed. The
 AttachedCollisionObject is the MoveIt/RViz counterpart: it is what makes the
 planner and RViz carry the cube with the hand.
 
-The box pose is configured in config/grasp_box.yaml (the launch file spawns
-the same cube and pedestal in Gazebo) and is expressed in the Gazebo world
-frame. The live base pose comes from libgazebo_ros_p3d's ground-truth
+The cube pose is configured in config/grasp_box.yaml (the launch file spawns
+that cube in Gazebo; the table comes from demo.world) and is expressed in the
+Gazebo world frame. The live base pose comes from libgazebo_ros_p3d's ground-truth
 odometry (/ground_truth/odom), not from the differential-drive /odom: the
 latter is wheel odometry and over a 1 m drive it ended up ~3 cm and ~2.5
 degrees away from where the robot really was, which is enough to make the
@@ -84,8 +84,8 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from my_robot_sim.grasp_box import (
     box_pose,
     load_config,
-    pedestal_dimensions,
-    pedestal_pose,
+    table_dimensions,
+    table_pose,
 )
 
 ARM_JOINTS = tuple('panda_joint%d' % index for index in range(1, 8))
@@ -238,7 +238,7 @@ ORIENTATION_TOLERANCE = 0.05  # rad, about 2.9 degrees
 JOINT_TOLERANCE = 0.01  # rad or m
 
 BOX_OBJECT_ID = 'grasp_box'
-PEDESTAL_OBJECT_ID = 'grasp_pedestal'
+TABLE_OBJECT_ID = 'grasp_table'
 
 # Gazebo entity names. The task node tells the my_robot_grasp_attach plugin to
 # weld these two links together once the fingers squeeze the cube.
@@ -409,8 +409,8 @@ def squeeze_outcome(positions, size, tolerance=SQUEEZE_CONTACT_TOLERANCE,
     measured failure mode of a rotated cube: both pads press opposite
     vertical edges, so the gap is the face diagonal, sqrt(2) * size.
     ``missed`` means the fingers closed completely without the cube between
-    them; ``blocked`` is anything else (the cube on the pedestal, an arm
-    link, or a stuck finger).
+    them; ``blocked`` is anything else (the cube on the table, an arm link,
+    or a stuck finger).
     """
     gap = finger_gap(positions)
     if pads_hold_a_cube(positions, size, tolerance, penetration):
@@ -500,6 +500,13 @@ def inverse_quaternion(quaternion):
     """Conjugate of a unit (x, y, z, w) quaternion."""
     x, y, z, w = quaternion
     return (-x, -y, -z, w)
+
+
+def quaternion_yaw(quaternion):
+    """Yaw of a (x, y, z, w) quaternion."""
+    x, y, z, w = (float(value) for value in quaternion)
+    return math.atan2(2.0 * (w * z + x * y),
+                      1.0 - 2.0 * (y * y + z * z))
 
 
 def rotate_vector(quaternion, vector):
@@ -679,13 +686,16 @@ def make_gripper_goal(position):
 
 def make_box_object(position, dimensions, frame_id=ARM_BASE_FRAME,
                     object_id=BOX_OBJECT_ID,
-                    operation=CollisionObject.ADD):
-    """Build a CollisionObject for an axis-aligned box at ``position``."""
+                    operation=CollisionObject.ADD, yaw=0.0):
+    """Build a CollisionObject for a box at ``position``, rotated by ``yaw``."""
     pose = Pose()
     pose.position.x = float(position[0])
     pose.position.y = float(position[1])
     pose.position.z = float(position[2])
-    pose.orientation.w = 1.0
+    # The long table must keep its world orientation when the base faces the
+    # cube at an angle; the cube itself is square, so yaw is irrelevant there.
+    pose.orientation.z = math.sin(float(yaw) / 2.0)
+    pose.orientation.w = math.cos(float(yaw) / 2.0)
 
     message = CollisionObject()
     message.header.frame_id = frame_id
@@ -934,6 +944,37 @@ class MobileManipulationNode(Node):
         rotation = transform.transform.rotation
         return quaternion_multiply(
             (rotation.x, rotation.y, rotation.z, rotation.w), quaternion)
+
+    def table_yaw_in_arm_frame(self):
+        """
+        Yaw that keeps the world-aligned table aligned in panda_link0.
+
+        The table model in demo.world is axis-aligned. When the base stops
+        facing the cube at an angle, the table appears rotated by the
+        opposite yaw in the arm frame; publishing an unrotated long box would
+        put its far half in the wrong place in the planning scene.
+        """
+        pose = self.base_pose()
+        if pose is not None:
+            rotation = pose.orientation
+            return -quaternion_yaw(
+                (rotation.x, rotation.y, rotation.z, rotation.w))
+
+        # No ground truth: odom is world-aligned at the start of a run, so
+        # the arm <- odom yaw is already the table's yaw in the arm frame.
+        transform = self.tf_buffer.lookup_transform(
+            ARM_BASE_FRAME, ODOM_FRAME, Time())
+        rotation = transform.transform.rotation
+        return quaternion_yaw(
+            (rotation.x, rotation.y, rotation.z, rotation.w))
+
+    def make_table_object(self):
+        """Collision object for the fixed long table, in panda_link0."""
+        centre = self.point_in_arm_frame(table_pose(self.grasp))
+        return make_box_object(
+            (centre.x, centre.y, centre.z), table_dimensions(self.grasp),
+            object_id=TABLE_OBJECT_ID,
+            yaw=self.table_yaw_in_arm_frame())
 
     def publish_collision_objects(self, messages):
         """Add or remove world objects and let MoveIt process the update."""
@@ -1464,7 +1505,6 @@ class MobileManipulationNode(Node):
                 return False
 
         box = self.point_in_arm_frame(box_pose(self.grasp))
-        pedestal = self.point_in_arm_frame(pedestal_pose(self.grasp))
         box_xyz = (box.x, box.y, box.z)
         self.get_logger().info(
             '箱子中心在 %s 下为 (%0.3f, %0.3f, %0.3f)。'
@@ -1473,11 +1513,8 @@ class MobileManipulationNode(Node):
         size = self.grasp['size']
         box_object = make_box_object(
             box_xyz, (size, size, size), object_id=BOX_OBJECT_ID)
-        pedestal_object = make_box_object(
-            (pedestal.x, pedestal.y, pedestal.z),
-            pedestal_dimensions(self.grasp),
-            object_id=PEDESTAL_OBJECT_ID)
-        self.publish_collision_objects([box_object, pedestal_object])
+        table_object = self.make_table_object()
+        self.publish_collision_objects([box_object, table_object])
 
         # The base stops yawed relative to the cube; aim the fingers along the
         # cube's faces rather than along the arm frame.

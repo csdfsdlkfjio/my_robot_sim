@@ -142,10 +142,11 @@ def test_standoff_is_within_the_arm_reach():
     One metre is beyond the Panda's 0.85 m reach from panda_link0.
 
     The visual grasp measures the cube from the look pose (0.58 m ahead of
-    the arm base) and expects it 0.45-0.55 m in front of the base, so the
-    default standoff must stay in that band.
+    the arm base) and expects it 0.45-0.65 m in front of the base, so the
+    default standoff must stay in that band. It also has to clear the long
+    table; test_map_assets checks that separately.
     """
-    assert 0.4 <= STANDOFF_DISTANCE <= 0.6
+    assert 0.55 <= STANDOFF_DISTANCE <= 0.65
 
 
 def test_navigate_goal_carries_the_map_pose_and_heading():

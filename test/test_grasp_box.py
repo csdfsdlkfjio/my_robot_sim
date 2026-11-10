@@ -12,10 +12,8 @@ from my_robot_sim.grasp_box import (
     box_pose,
     box_sdf,
     load_config,
-    pedestal_dimensions,
-    pedestal_height,
-    pedestal_pose,
-    pedestal_sdf,
+    table_dimensions,
+    table_pose,
 )
 
 PKG_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -39,8 +37,10 @@ def test_config_describes_a_5cm_cube_beyond_the_chassis():
     assert config['size'] == pytest.approx(0.05)
     assert config['mass'] > 0.0
     assert config['x'] > 1.3
-    assert config['z'] == pytest.approx(0.25)
-    assert config['pedestal_size'] > config['size']
+    assert config['z'] == pytest.approx(
+        config['table_height'] + config['size'] / 2.0)
+    assert config['table_size_x'] > config['size']
+    assert config['table_size_y'] > config['table_size_x']
     assert box_pose(config) == (config['x'], config['y'], config['z'])
 
 
@@ -50,15 +50,19 @@ def test_tcp_offset_clears_the_palm():
     assert config['tcp_offset'] > PALM_DEPTH + config['size'] / 2.0
 
 
-def test_pedestal_top_meets_the_cube_bottom():
-    """A free cube at z = 0.25 would fall, so a pedestal supports it."""
+def test_table_top_meets_the_cube_bottom():
+    """A free cube must rest on the table top, and the table must be long."""
     config = load_config(CONFIG)
     bottom = config['z'] - config['size'] / 2.0
-    assert pedestal_height(config) == pytest.approx(bottom)
-    assert pedestal_pose(config) == pytest.approx(
-        (config['x'], config['y'], bottom / 2.0))
-    assert pedestal_dimensions(config) == pytest.approx(
-        (config['pedestal_size'], config['pedestal_size'], bottom))
+    assert config['table_height'] == pytest.approx(bottom)
+    assert table_pose(config) == pytest.approx(
+        (config['table_x'], config['table_y'], config['table_height'] / 2.0))
+    assert table_dimensions(config) == pytest.approx(
+        (config['table_size_x'], config['table_size_y'],
+         config['table_height']))
+    # The long axis is Y so the cube can be moved left/centre/right.
+    assert config['table_size_y'] >= 1.5
+    assert config['table_size_x'] < config['table_size_y']
 
 
 def test_box_sdf_is_a_dynamic_cube_with_grasp_friction():
@@ -99,34 +103,19 @@ def test_box_sdf_names_match_the_attach_command():
 
 
 def test_box_is_never_auto_disabled():
-    """A cube resting on the pedestal must stay simulated to be picked up."""
+    """A cube resting on the table must stay simulated to be picked up."""
     config = load_config(CONFIG)
     model = ET.fromstring(box_sdf(config)).find('model')
     assert model.findtext('allow_auto_disable').strip() == 'false'
 
 
-def test_pedestal_sdf_is_static_and_reaches_the_cube():
-    """The pedestal top face must be exactly at the cube's bottom face."""
-    config = load_config(CONFIG)
-    model = ET.fromstring(pedestal_sdf(config)).find('model')
-    assert model.get('name') == 'grasp_pedestal'
-    assert model.findtext('static').strip() == 'true'
-    size = [float(value) for value in
-            model.find('link/collision/geometry/box/size').text.split()]
-    assert size == pytest.approx(pedestal_dimensions(config))
-    assert size[2] == pytest.approx(config['z'] - config['size'] / 2.0)
-
-
-def test_sdf_models_are_accepted_by_gazebo(tmp_path):
+def test_box_sdf_is_accepted_by_gazebo(tmp_path):
     """Malformed SDF makes spawn_entity fail silently in the launch."""
-    config = load_config(CONFIG)
-    for name, builder in (('grasp_box', box_sdf),
-                          ('grasp_pedestal', pedestal_sdf)):
-        path = tmp_path / (name + '.sdf')
-        path.write_text(builder(config), encoding='utf-8')
-        result = subprocess.run(
-            ['gz', 'sdf', '-p', str(path)], capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr
+    path = tmp_path / 'grasp_box.sdf'
+    path.write_text(box_sdf(load_config(CONFIG)), encoding='utf-8')
+    result = subprocess.run(
+        ['gz', 'sdf', '-p', str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_load_config_rejects_a_palm_collision(tmp_path):

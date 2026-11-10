@@ -25,23 +25,16 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
-    RegisterEventHandler,
     SetEnvironmentVariable,
     TimerAction,
 )
 from launch.conditions import IfCondition
-from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from moveit_configs_utils import MoveItConfigsBuilder
 
-from my_robot_sim.grasp_box import (
-    box_sdf,
-    load_config,
-    pedestal_pose,
-    pedestal_sdf,
-)
+from my_robot_sim.grasp_box import box_sdf, load_config
 
 
 def generate_launch_description():
@@ -92,7 +85,7 @@ def generate_launch_description():
     # gzserver resolves a URDF <plugin filename="libgazebo_grasp_attach.so"/>
     # on GAZEBO_PLUGIN_PATH. The grasp weld plugin lives in
     # my_robot_grasp_attach; without its lib directory gzserver silently skips
-    # the plugin and the cube would never leave the pedestal.
+    # the plugin and the cube would never leave the table.
     attach_lib_dir = os.path.join(
         get_package_prefix('my_robot_grasp_attach'), 'lib')
     if not os.path.isdir(attach_lib_dir):
@@ -147,57 +140,39 @@ def generate_launch_description():
         output='screen',
     )
 
-    # The grasp cube and the pedestal holding it up are described by
-    # config/grasp_box.yaml. spawn_entity.py only accepts files, so render the
-    # SDF text once at launch time into a temporary directory.
+    # The grasp cube is described by config/grasp_box.yaml; the table it
+    # rests on is a static model in demo.world, so it is already present
+    # before SLAM and Nav2 start. spawn_entity.py only accepts files, so
+    # render the cube SDF text once at launch time into a temporary
+    # directory.
     grasp = load_config(os.path.join(pkg_share, 'config', 'grasp_box.yaml'))
     grasp_sdf_dir = tempfile.mkdtemp(prefix='my_robot_sim_grasp_')
-    grasp_files = {}
-    for entity, builder in (('grasp_box', box_sdf),
-                            ('grasp_pedestal', pedestal_sdf)):
-        path = os.path.join(grasp_sdf_dir, entity + '.sdf')
-        with open(path, 'w', encoding='utf-8') as handle:
-            handle.write(builder(grasp))
-        grasp_files[entity] = path
-
-    def grasp_spawner(entity, position):
-        return Node(
-            package='gazebo_ros',
-            executable='spawn_entity.py',
-            arguments=[
-                '-entity', entity,
-                '-file', grasp_files[entity],
-                '-x', '%g' % position[0],
-                '-y', '%g' % position[1],
-                '-z', '%g' % position[2],
-            ],
-            output='screen',
-        )
-
-    # Spawners started together run in parallel. The cube is free to fall, so
-    # if it reaches the world before the static pedestal it drops through the
-    # empty space where the pedestal will appear and ends up embedded. Chain
-    # the cube spawn on the pedestal spawner's exit so the support is there
-    # first.
-    pedestal_spawner = grasp_spawner(
-        'grasp_pedestal', pedestal_pose(grasp))
-    box_spawner = grasp_spawner(
-        'grasp_box', (grasp['x'], grasp['y'], grasp['z']))
-    spawn_box_after_pedestal = RegisterEventHandler(
-        OnProcessExit(
-            target_action=pedestal_spawner,
-            on_exit=[box_spawner],
-        ))
+    grasp_file = os.path.join(grasp_sdf_dir, 'grasp_box.sdf')
+    with open(grasp_file, 'w', encoding='utf-8') as handle:
+        handle.write(box_sdf(grasp))
 
     # spawn_entity.py only waits 30 s for /spawn_entity to be advertised.
     # On a cold WSL2 start gzserver can need longer than that to load the
     # world (and to give up on the online model database), so every spawner
     # starts, times out with "Service /spawn_entity unavailable", and leaves
-    # the robot and pedestal unspawned. Give Gazebo a five-second head start
-    # before the spawners begin their own wait.
+    # the robot and cube unspawned. Give Gazebo a five-second head start
+    # before the spawners begin their own wait. The table is part of the
+    # world file, so the cube can spawn in parallel with the robot.
+    box_spawner = Node(
+        package='gazebo_ros',
+        executable='spawn_entity.py',
+        arguments=[
+            '-entity', 'grasp_box',
+            '-file', grasp_file,
+            '-x', '%g' % grasp['x'],
+            '-y', '%g' % grasp['y'],
+            '-z', '%g' % grasp['z'],
+        ],
+        output='screen',
+    )
     spawn_entities = TimerAction(
         period=5.0,
-        actions=[spawn_entity, pedestal_spawner],
+        actions=[spawn_entity, box_spawner],
     )
 
     # gazebo_ros2_control creates /controller_manager inside gzserver. The
@@ -286,7 +261,6 @@ def generate_launch_description():
         gzclient,
         robot_state_publisher,
         spawn_entities,
-        spawn_box_after_pedestal,
         TimerAction(period=3.0, actions=controller_spawners),
         move_group,
         rviz,

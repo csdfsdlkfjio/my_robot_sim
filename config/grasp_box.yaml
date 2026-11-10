@@ -1,9 +1,9 @@
-# The cube the mobile manipulator picks up, and the static pedestal it rests
-# on.
+# The cube the mobile manipulator picks up, and the long table it rests on.
 #
-# This file is the single source of truth: the launch file spawns both models
-# in Gazebo from it, and mobile_manipulation_node uses the same numbers for
-# its MoveIt goals and its planning-scene (RViz) collision objects.
+# This file is the single source of truth for the cube and for the table's
+# geometry used by MoveIt's planning scene. The table itself is a static
+# model named grasp_table in worlds/demo.world, so it exists before SLAM and
+# Nav2 start; test_map_assets.py checks that the two descriptions agree.
 #
 # Poses are in the Gazebo world frame. The robot spawns at the world origin
 # and the differential-drive plugin starts /odom there, so the odom frame
@@ -11,19 +11,25 @@
 #
 # Note on the requested (1.0, 0, 0.25): after the requested 1.0 m drive the
 # chassis centre is already at x ~= 1.0, so a cube at x = 1.0 would sit inside
-# the robot. x = 1.45 leaves the cube ~0.49 m in front of panda_link0, which
+# the robot. x = 1.45 leaves the cube ~0.45 m in front of panda_link0, which
 # is the reach this arm was verified to hold while pointing straight down.
 #
-# z = 0.25 is the cube centre, so its bottom face is at 0.225. A free cube
-# spawned there would fall, hence the static pedestal whose top face is at
-# exactly that height.
+# The table is 2.0 m long (Y) and 0.6 m deep (X) so the cube can be moved
+# left/centre/right along Y for lateral-grasp tests. Its top is 0.30 m above
+# the floor, 5 cm above the lidar's 0.25 m scan plane: a 0.25 m top would be
+# coplanar with the scan and the table would drop in and out of the map. The
+# cube centre is therefore table_height + size / 2 = 0.325 m.
 grasp_box:
   size: 0.05              # cube edge length [m]
   mass: 0.05              # [kg] a 5 cm plastic cube
-  x: 1.45                 # cube centre [m], world frame
-  y: 0.0
-  z: 0.25
-  pedestal_size: 0.16     # square pedestal footprint edge [m]
+  x: 1.45                 # initial cube centre [m], world frame
+  y: 0.0                  # move it along Y for the left/centre/right tests
+  z: 0.325                # table_height + size / 2
+  table_x: 1.45           # table centre [m], fixed while the cube moves
+  table_y: 0.0
+  table_size_x: 0.60      # depth across the approach direction [m]
+  table_size_y: 2.00      # long axis, used for lateral positions [m]
+  table_height: 0.30      # top face height [m]
   friction: 2.0           # cube/ground contact friction coefficient
 
   # Grasp geometry. tcp_offset is the distance from the panda_hand frame

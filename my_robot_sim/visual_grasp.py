@@ -783,6 +783,11 @@ class VisualGraspNode(MobileManipulationNode):
                     % (ODOM_FRAME, ARM_BASE_FRAME))
                 return False
 
+        # The arm reaches over a 0.6 m deep table. Put it in the planning
+        # scene so MoveIt does not route the wrist or fingers through it;
+        # without it Gazebo is the only thing that would notice a collision.
+        self.publish_collision_objects([self.make_table_object()])
+
         self.get_logger().info('等待相机和相机内参 ...')
         if not self.wait_for_camera_info():
             self.get_logger().error(

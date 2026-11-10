@@ -1,6 +1,15 @@
 <?xml version="1.0"?>
-<!-- 8 x 8 m 的封闭房间，内含两个障碍物，用于 SLAM 建图和 Nav2 导航演示。
-     空世界（empty.world）里雷达所有回波都是 inf，SLAM 只会得到一张空白地图。 -->
+<!-- 8 x 8 m 的封闭房间，内含两个障碍物和一张长桌，用于 SLAM 建图、
+     Nav2 导航和移动抓取演示。
+     空世界（empty.world）里雷达所有回波都是 inf，SLAM 只会得到一张空白地图。
+
+     长桌 grasp_table 沿 Y 轴摆放（2.0 m 长、0.6 m 深），红方块默认放在
+     桌面中心。桌面高 0.30 m，而不是需求里举例的 0.25 m：底盘雷达的扫描
+     平面在离地 0.25 m，桌面正好落在扫描平面上时，水平射线与桌面共面，
+     回波时有时无，桌子就无法可靠地进入地图和 Nav2 代价地图。抬高 5 cm
+     后，雷达能稳定打到桌面侧壁，桌子才会被当成障碍物避开。
+     桌面顶面高度必须和 config/grasp_box.yaml 的 table_height 一致，
+     test_map_assets.py 会检查。 -->
 <sdf version="1.7">
   <world name="default">
     <physics type="ode">
@@ -76,10 +85,29 @@
       </link>
     </model>
 
-    <!-- 房内障碍物 1 -->
+    <!-- 长桌：沿 Y 轴 2.0 m 长，沿 X 轴 0.6 m 深，高 0.30 m。
+         桌面前沿在 x = 1.15，底座中心在 x = 1.45。机器人从原点沿 +x
+         接近时，Nav2 的观察位（standoff）在 x ~= 0.85，桌子不会挡在
+         起点到观察位的路径上。红方块由 launch 生成在桌面中心。 -->
+    <model name="grasp_table">
+      <static>true</static>
+      <pose>1.45 0.0 0.15 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.6 2.0 0.3</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.6 2.0 0.3</size></box></geometry>
+          <material><script><name>Gazebo/Grey</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 房内障碍物 1。原来在 (1.5, 1.0)，会与沿 Y 轴摆放到 ±1.0 的长桌
+         重叠，因此移到桌子北侧留出空隙。 -->
     <model name="box_1">
       <static>true</static>
-      <pose>1.5 1.0 0.25 0 0 0</pose>
+      <pose>1.5 2.5 0.25 0 0 0</pose>
       <link name="link">
         <collision name="collision">
           <geometry><box><size>0.5 0.5 0.5</size></box></geometry>

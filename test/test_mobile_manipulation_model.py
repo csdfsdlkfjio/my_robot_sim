@@ -132,7 +132,7 @@ def test_robot_model_loads_the_grasp_attach_plugin(robot):
 
     The launch file puts my_robot_grasp_attach's lib directory on
     GAZEBO_PLUGIN_PATH; this test pins the file name the URDF asks for. Without
-    the plugin the cube stays on its pedestal when the arm lifts.
+    the plugin the cube stays on the table when the arm lifts.
     """
     plugins = {
         plugin.get('name'): plugin for plugin in robot.iter('plugin')}

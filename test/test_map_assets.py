@@ -5,11 +5,20 @@ import os
 import xml.etree.ElementTree as ET
 
 import numpy as np
+import pytest
 import yaml
+
+from my_robot_sim.grasp_box import (
+    load_config,
+    table_dimensions,
+    table_pose,
+)
+from my_robot_sim.search_and_grasp import STANDOFF_DISTANCE
 
 PKG_ROOT = os.path.join(os.path.dirname(__file__), '..')
 MAP_YAML = os.path.join(PKG_ROOT, 'maps', 'my_map.yaml')
 DEMO_WORLD = os.path.join(PKG_ROOT, 'worlds', 'demo.world')
+GRASP_CONFIG = os.path.join(PKG_ROOT, 'config', 'grasp_box.yaml')
 
 
 def load_map_info():
@@ -46,6 +55,72 @@ def test_map_image_exists_and_is_valid():
     width, height = read_pgm_header(image_path)
     assert width > 0 and height > 0
     assert os.path.getsize(image_path) > width * height
+
+
+def read_world_box(name):
+    """Return (pose, size) of a world model's box collision."""
+    root = ET.parse(DEMO_WORLD).getroot()
+    model = root.find('world/model[@name="%s"]' % name)
+    assert model is not None, 'demo.world has no %s' % name
+    pose = [float(value) for value in model.find('pose').text.split()]
+    size = [float(value) for value in
+            model.find('link/collision/geometry/box/size').text.split()]
+    return pose, size
+
+
+def test_world_table_matches_the_grasp_config():
+    """
+    The static world table and the MoveIt planning-scene table must agree.
+
+    The table lives in demo.world so SLAM and Nav2 see it from the start;
+    grasp_box.yaml repeats its numbers for the planning scene. If the two
+    drift apart MoveIt would avoid a table that is not there and miss the
+    one that is.
+    """
+    config = load_config(GRASP_CONFIG)
+    pose, size = read_world_box('grasp_table')
+    assert pose[:3] == pytest.approx(table_pose(config))
+    assert pose[3:] == pytest.approx([0.0, 0.0, 0.0])
+    assert size == pytest.approx(table_dimensions(config))
+    # The cube must rest on the world table top, not float or sink.
+    assert size[2] == pytest.approx(
+        config['z'] - config['size'] / 2.0)
+
+
+def test_standoff_clears_the_long_table():
+    """
+    The Nav2 observation pose must leave room for the 0.22 m footprint.
+
+    The robot approaches the table along +x. The standoff goal is 0.6 m from
+    the cube centre; the table's near face is 0.30 m from it, so the base
+    centre is 0.30 m from the table and the footprint clears it.
+    """
+    config = load_config(GRASP_CONFIG)
+    pose, size = read_world_box('grasp_table')
+    near_face_x = pose[0] - size[0] / 2.0
+    standoff_x = config['x'] - STANDOFF_DISTANCE
+    assert standoff_x < near_face_x, 'the observation pose is inside the table'
+    assert near_face_x - standoff_x >= 0.27, (
+        'the 0.22 m footprint would touch the table')
+    # The path from the robot start (0, 0) to the observation pose is along
+    # -x of the table and must not cross it.
+    assert 0.0 < standoff_x < near_face_x
+
+
+def test_world_obstacle_does_not_overlap_the_table():
+    """Moving box_1 must not leave it intersecting the new table."""
+    table_pose_values, table_size = read_world_box('grasp_table')
+    box_pose_values, box_size = read_world_box('box_1')
+
+    def separated(axis):
+        table_min = table_pose_values[axis] - table_size[axis] / 2.0
+        table_max = table_pose_values[axis] + table_size[axis] / 2.0
+        box_min = box_pose_values[axis] - box_size[axis] / 2.0
+        box_max = box_pose_values[axis] + box_size[axis] / 2.0
+        return box_max <= table_min or box_min >= table_max
+
+    # Two AABBs are disjoint when they are separated on at least one axis.
+    assert separated(0) or separated(1), 'box_1 overlaps the table'
 
 
 def test_demo_world_is_valid_sdf():

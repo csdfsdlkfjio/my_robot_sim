@@ -20,7 +20,7 @@ Stages:
 Why the camera and not the lidar: lidar_link sits 5 cm above base_link, which
 is 0.20 m high, so the scan plane is at z ~= 0.25 m -- it grazes the cube
 (0.225-0.275 m) and only a couple of rays can hit it. A scan can also never
-identify the cube as red: the pedestal, the walls and the blue/orange boxes
+identify the cube as red: the table, the walls and the blue/orange boxes
 all come back as obstacles. The wrist camera is the sensor that both sees the
 small cube and knows its colour.
 
@@ -97,10 +97,12 @@ SEARCH_DETECTION_TIMEOUT = 1.0  # s per step
 SEARCH_SETTLE_AFTER_LOOK = 0.3  # s, lets the arm stop before the first look
 
 # Nav2 goal distance from the cube centre. The Panda reaches about 0.85 m
-# from panda_link0, and the visual grasp expects the cube roughly 0.45-0.55 m
-# in front of base_link (its proven run had it 0.43 m ahead), so 1 m would be
-# out of reach.
-STANDOFF_DISTANCE = 0.5  # m
+# from panda_link0, and the visual grasp expects the cube roughly 0.45-0.65 m
+# in front of base_link, so 1 m would be out of reach. 0.6 m is the closest
+# goal that still keeps the 0.22 m footprint clear of the new long table:
+# its front face is 0.30 m behind the cube centre at the table's middle, so a
+# 0.5 m standoff would put the base circle 2 cm inside the table.
+STANDOFF_DISTANCE = 0.6  # m
 NAV_START_TIMEOUT = 30.0  # s for the goal to be accepted
 NAV_TIMEOUT = 180.0  # s hard cap for the goal to finish
 NAV_FEEDBACK_PERIOD = 3.0  # s between distance logs

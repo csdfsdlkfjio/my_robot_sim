@@ -1,11 +1,12 @@
 """
 The grasp target box: shared configuration and Gazebo SDF builders.
 
-``config/grasp_box.yaml`` is the single source of truth. The launch file
-spawns the cube and the pedestal it rests on in Gazebo with the SDF built
-here, and ``mobile_manipulation_node`` uses the same numbers for its MoveIt
-targets and planning-scene objects, so Gazebo, MoveIt and RViz cannot
-disagree about where the box is.
+``config/grasp_box.yaml`` describes the cube and the long table it rests on.
+The launch file spawns the cube in Gazebo with the SDF built here; the table
+itself is a static model in ``worlds/demo.world`` so SLAM and Nav2 can see it.
+``mobile_manipulation_node`` uses the same numbers for its MoveIt targets and
+planning-scene objects, so Gazebo, MoveIt and RViz cannot disagree about the
+table or the cube. A test compares the YAML table with the world model.
 
 Poses are in the Gazebo world frame. The robot spawns at the world origin.
 ``mobile_manipulation_node`` reads the live base pose from Gazebo's
@@ -30,7 +31,11 @@ CONFIG_KEYS = (
     'x',
     'y',
     'z',
-    'pedestal_size',
+    'table_x',
+    'table_y',
+    'table_size_x',
+    'table_size_y',
+    'table_height',
     'friction',
     'tcp_offset',
     'approach_clearance',
@@ -40,8 +45,8 @@ CONFIG_KEYS = (
 )
 
 POSITIVE_KEYS = (
-    'size', 'mass', 'friction', 'pedestal_size', 'squeeze_effort',
-    'lift_velocity')
+    'size', 'mass', 'friction', 'table_size_x', 'table_size_y',
+    'table_height', 'squeeze_effort', 'lift_velocity')
 NON_NEGATIVE_KEYS = ('approach_clearance', 'lift_height')
 
 
@@ -78,6 +83,22 @@ def load_config(path):
         raise ValueError(
             '%s: lift_velocity (%g) is a MoveIt velocity scaling factor, so '
             'it must not exceed 1.0' % (path, config['lift_velocity']))
+
+    table_top = config['table_height']
+    cube_bottom = config['z'] - config['size'] / 2.0
+    if abs(table_top - cube_bottom) > 1e-3:
+        raise ValueError(
+            '%s: the cube bottom (%g) must rest on the table top (%g); '
+            'set z = table_height + size / 2'
+            % (path, cube_bottom, table_top))
+    if abs(config['x'] - config['table_x']) > config['table_size_x'] / 2.0:
+        raise ValueError(
+            '%s: the cube x (%g) is not above the table top'
+            % (path, config['x']))
+    if abs(config['y'] - config['table_y']) > config['table_size_y'] / 2.0:
+        raise ValueError(
+            '%s: the cube y (%g) is not above the table top'
+            % (path, config['y']))
     return config
 
 
@@ -86,20 +107,16 @@ def box_pose(config):
     return (config['x'], config['y'], config['z'])
 
 
-def pedestal_height(config):
-    """Pedestal height so its top face touches the cube's bottom face."""
-    return config['z'] - config['size'] / 2.0
+def table_pose(config):
+    """Table centre in the world frame (the table is fixed, the cube is not)."""
+    return (config['table_x'], config['table_y'],
+            config['table_height'] / 2.0)
 
 
-def pedestal_pose(config):
-    """Pedestal centre in the world frame."""
-    return (config['x'], config['y'], pedestal_height(config) / 2.0)
-
-
-def pedestal_dimensions(config):
-    """Pedestal (x, y, z) edge lengths."""
-    return (config['pedestal_size'], config['pedestal_size'],
-            pedestal_height(config))
+def table_dimensions(config):
+    """Table (x, y, z) edge lengths; the long axis is Y."""
+    return (config['table_size_x'], config['table_size_y'],
+            config['table_height'])
 
 
 def box_sdf(config):
@@ -162,34 +179,3 @@ def box_sdf(config):
 </sdf>
 """ % (mass, inertia, inertia, inertia, dimensions, friction, friction,
        dimensions)
-
-
-def pedestal_sdf(config):
-    """Return the SDF for the static pedestal that holds the cube up."""
-    x_size, y_size, z_size = pedestal_dimensions(config)
-    dimensions = '%g %g %g' % (x_size, y_size, z_size)
-    return """<?xml version="1.0" ?>
-<sdf version="1.6">
-  <model name="grasp_pedestal">
-    <static>true</static>
-    <link name="link">
-      <collision name="collision">
-        <geometry>
-          <box><size>%s</size></box>
-        </geometry>
-      </collision>
-      <visual name="visual">
-        <geometry>
-          <box><size>%s</size></box>
-        </geometry>
-        <material>
-          <script>
-            <uri>file://media/materials/scripts/gazebo.material</uri>
-            <name>Gazebo/Grey</name>
-          </script>
-        </material>
-      </visual>
-    </link>
-  </model>
-</sdf>
-""" % (dimensions, dimensions)
