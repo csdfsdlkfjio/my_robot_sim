@@ -371,8 +371,8 @@ def lifted_position(grasp, height):
 class VisualGraspNode(MobileManipulationNode):
     """Grasp the red cube at the pose measured by the wrist camera."""
 
-    def __init__(self):
-        super().__init__('visual_grasp')
+    def __init__(self, node_name='visual_grasp'):
+        super().__init__(node_name)
         self.image_topic = str(self.declare_parameter(
             'image_topic', IMAGE_TOPIC).value)
         self.camera_info_topic = str(self.declare_parameter(
@@ -706,6 +706,16 @@ class VisualGraspNode(MobileManipulationNode):
             return False
         self.stop_and_settle()
 
+        return self.grasp_after_arrival()
+
+    def grasp_after_arrival(self):
+        """
+        Run steps 4-10: measure the cube with the wrist camera and grasp it.
+
+        Split out of run() so an orchestrator that has already positioned the
+        base (search_and_grasp drives here with Nav2) can reuse the whole
+        grasp without the fixed 1 m forward drive.
+        """
         if not self.wait_for_ground_truth():
             self.get_logger().warning(
                 '没有收到地面真值里程计，退回轮式里程计 TF（抓取可能有偏差）')
