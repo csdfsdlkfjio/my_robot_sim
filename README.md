@@ -72,7 +72,7 @@ my_robot_sim/
 ├── config/
 │   └── nav2_params.yaml     # Nav2 参数（AMCL 的 base_frame_id 改为 base_link）
 ├── maps/
-│   └── my_map.yaml/.pgm     # 用 demo.world 建好的地图，可直接用于 Nav2
+│   └── my_map.yaml/.pgm     # 由 demo.world 精确几何生成、与世界对齐的地图
 ├── worlds/
 │   └── demo.world           # 8×8 m 演示房间（四面墙 + 两个障碍物）
 ├── urdf/
@@ -200,7 +200,11 @@ ros2 run nav2_map_server map_saver_cli -f ~/ros2_ws/src/my_robot_sim/maps/my_map
 
 > `--symlink-install` 只对**编译时已存在**的文件建软链，新保存的 `my_map.*` 不会自动出现在 `install/` 里，需要再执行一次 `colcon build --symlink-install --packages-select my_robot_sim`。
 
-仓库里自带的 `maps/my_map.*` 就是用 `demo.world` 建好的版本（223×267 栅格，occupied 2656 / free 25183），可以直接拿来跑 Nav2；自己重新建图会覆盖它。
+仓库里自带的 `maps/my_map.*` 不是 SLAM 输出，而是**按 `demo.world` 的精确几何生成**的占据栅格（174×174 栅格、0.05 m/格，origin `[-4.35, -4.35]`，occupied 1532 / free 24720）。它和 Gazebo 世界坐标对齐：机器人出生在 `(0, 0)`、朝向 +x，所以 AMCL 的正确初值就是 `(0, 0, 0)`。
+
+> 旧版本里那张 223×267 的 SLAM 地图把房间相对世界旋转了约 52°，而且有两套重叠的墙线。原地搜索旋转时 AMCL 会在两个假设之间跳（实测 180° 跳变），Nav2 就会朝错误方向开。这一版地图去掉了那两处问题，`nav2_params.yaml` 里的 AMCL 初值也直接设成了 `(0, 0, 0)`。
+
+自己重新建图会覆盖仓库里的这份；如果新地图的坐标系不是世界坐标系，记得到 `nav2_params.yaml` 里改 `initial_pose`。
 
 ### Nav2 导航
 
@@ -213,13 +217,59 @@ ros2 launch my_robot_sim nav2.launch.py
 # ros2 launch my_robot_sim nav2.launch.py map:=/绝对路径/xxx.yaml
 ```
 
-RViz 打开后先用工具栏的 **2D Pose Estimate** 给出初始位姿（地图上点一下并拖出朝向），AMCL 才会发布 `map → odom`；之后用 **Nav2 Goal** 发送目标点。
+`config/nav2_params.yaml` 里已经写好了 `set_initial_pose: true` 和 `initial_pose: (0, 0, 0)`，与仓库地图配套，启动后 AMCL 立即发布 `map → odom`。如果你换了地图（或启动 Nav2 前把机器人挪走了），要用 RViz 的 **2D Pose Estimate** 重新给初值，否则 Nav2 的 `global_costmap` 会一直等 `map → base_link`，`planner_server` 停在 inactive。
 
-导航参数来自本包的 `config/nav2_params.yaml`（`nav2_bringup` 默认参数的一份副本，唯一改动是 AMCL 的 `base_frame_id`：本车没有 `base_footprint`，必须用 `base_link`）。需要调参时改这个文件，也可以这样换一份：
+初值给好后，用 **Nav2 Goal** 发送目标点。
+
+导航参数来自本包的 `config/nav2_params.yaml`（`nav2_bringup` 默认参数的一份副本，改动集中在 AMCL：`base_frame_id` 用 `base_link`（本车没有 `base_footprint`）；运动噪声 `alpha*` 收到 0.01、`max_beams` 提到 360、命中模型权重调高——方形房间在旋转下几乎对称，默认参数会让粒子云在搜索旋转时被错误的 90° 假设吸走）。需要调参时改这个文件，也可以这样换一份：
 
 ```bash
 ros2 launch my_robot_sim nav2.launch.py params_file:=/绝对路径/nav2_params.yaml
 ```
+
+### 自主搜索与移动抓取（search_and_grasp）
+
+`my_robot_sim/search_and_grasp.py` 是移动操作的总控状态机，直接复用已经验证过的 `visual_grasp` 流程：
+
+1. **搜索**：腕部相机移到前视位姿，底盘原地每步转 30°，共 12 步（360°）；每一步做红色分割 + 顶面反投影，得到方块在 `panda_link0` 下的点，再用 TF 换到 `map`。
+2. **导航**：调用 Nav2 的 `NavigateToPose`，走到离方块 `standoff`（默认 0.50 m）的位置，并转身面对方块。0.5 m 是 Panda 从 `panda_link0` 算起的可抓距离；1 m 会超出约 0.85 m 的臂展。
+3. **抓取**：底盘停稳后执行 `grasp_after_arrival()`（视觉测量 → 预抓取 → 下探 → 预闭合 → 10 N 夹紧 → 焊点固定 → 抬升 10 cm）。
+4. **重试**：视觉测量或抓取失败时，后退 20 cm，重新观察再抓一次（默认 2 次）。
+
+**前提**：`mobile_manipulation.launch.py`（Gazebo + 机械臂 + 相机）和 `nav2.launch.py` 都已在跑，且 AMCL 已定位（本仓库地图的初值已在参数里设好）。完整步骤：
+
+```bash
+source ~/ros2_ws/install/setup.bash
+# 终端 1：仿真 + 机械臂
+ros2 launch my_robot_sim mobile_manipulation.launch.py \
+  world:=$(ros2 pkg prefix --share my_robot_sim)/worlds/demo.world
+# 终端 2：Nav2（地图和初值都用仓库配置）
+ros2 launch my_robot_sim nav2.launch.py
+# 终端 3：总控
+ros2 run my_robot_sim search_and_grasp
+```
+
+如果启动 Nav2 时机器人不在世界原点，或者换了地图，给总控节点传初值：
+
+```bash
+ros2 run my_robot_sim search_and_grasp --ros-args \
+  -p publish_initial_pose:=true -p initial_x:=0.0 -p initial_y:=0.0 -p initial_yaw:=0.0
+```
+
+**成功时终端里的关键输出**（数字来自实测）：
+
+```
+搜索：第 1 步看到红色区域，像素 (337, 419)，面积 2555 px²，开始反投影...
+搜索成功：方块在 panda_link0 下为 (0.9404, -0.0641, 0.0407)（来源：顶面点云），地图坐标为 (1.4815, -0.0078)。
+导航：方块在 (1.48, -0.01)，机器人在 (0.58, -0.12)，目标停在离方块 0.50 m 的 (0.99, -0.07)，朝向 7° ...
+方块上表面的世界坐标为 (1.4437, 0.0055, 0.2763)；...
+下探后夹爪中心与方块中心的水平偏差为 7.0 mm（沿手指方向 6.4 mm，允许 12.0 mm）。
+预闭合后两指停在 (0.0364, 0.0364) m，与目标一致。
+Gazebo 已把 grasp_box 固定到 panda_hand 上
+找-走-抓完成：方块已被夹爪提起。
+```
+
+方块真实位置是 `(1.45, 0, 0.25)`（见 `config/grasp_box.yaml`）。搜索阶段的地图坐标允许几厘米误差（AMCL 估计），最终抓取用的是腕部相机测得的世界坐标，所以抓取精度不受搜索误差影响。
 
 ### 查看运行状态
 
@@ -569,7 +619,7 @@ ros2 topic echo /scan --once    # 360 个 ranges，有效回波 0 个
 
 > 判断一张已保存的地图是否为空：PGM 里所有像素都是 205（灰度 205 = unknown）。只要出现 0（occupied）或 254（free），就说明建图时确实采到了障碍物。
 >
-> 仓库当前自带的 `maps/my_map.*` 已经用 `demo.world` 重新建图，不是这张空白图（223×267，occupied 2656 / free 25183）。
+> 仓库当前自带的 `maps/my_map.*` 是按 `demo.world` 的精确几何生成的（174×174，occupied 1532 / free 24720），不是这张空白图；早期那版 SLAM 地图（223×267，occupied 2656 / free 25183）已被替换，原因见“用演示世界建图”一节。
 
 ### 8. RViz 的 RobotModel 报 `No transform from [left_wheel]`
 

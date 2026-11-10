@@ -1,11 +1,17 @@
 amcl:
   ros__parameters:
     use_sim_time: True
-    alpha1: 0.2
-    alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.2
-    alpha5: 0.2
+    # Gazebo 的差速轮插件把 /odom 报得和真实位姿一样准（实测与
+    # /ground_truth/odom 完全一致），而 0.2 的默认噪声模型会在原地旋转时
+    # 把粒子云摊开。8x8 m 的方形房间在 90 度旋转下几乎对称，摊开的粒子
+    # 会被错误的对称假设吸走：实测搜索旋转中偏航误差最大到 48 度，
+    # Find-Drive-Grasp 因此把方块定位偏了半米。噪声调到 0.01 后，同样的
+    # 12 步旋转全程偏航误差 <= 1.8 度。
+    alpha1: 0.01
+    alpha2: 0.01
+    alpha3: 0.01
+    alpha4: 0.01
+    alpha5: 0.01
     # 本项目 URDF 的根部 link 是 base_link，没有 base_footprint。
     # Nav2 默认值 base_footprint 会让 AMCL 报
     # "Couldn't transform from lidar_link to base_footprint" 并拒绝初始化，
@@ -21,9 +27,11 @@ amcl:
     laser_max_range: 100.0
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
-    max_beams: 60
-    max_particles: 2000
-    min_particles: 500
+    # 用满 360 条雷达光线：房间里只有两个箱子能打破 90 度对称，60 条
+    # 光线时它们的贡献被四面墙淹没。
+    max_beams: 360
+    max_particles: 5000
+    min_particles: 1000
     odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
@@ -32,16 +40,27 @@ amcl:
     resample_interval: 1
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
-    sigma_hit: 0.2
+    # 地图由 demo.world 的精确几何生成，Gazebo 雷达也没有噪声，所以把
+    # 命中模型的权重调高、随机项调低，让似然场对 5 cm 的方块敏感。
+    sigma_hit: 0.1
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.2
-    update_min_d: 0.25
-    z_hit: 0.5
+    update_min_a: 0.05
+    update_min_d: 0.05
+    z_hit: 0.9
     z_max: 0.05
-    z_rand: 0.5
+    z_rand: 0.1
     z_short: 0.05
     scan_topic: scan
+    # maps/my_map.* 与世界坐标系对齐，机器人出生在世界原点，所以直接给
+    # AMCL 初值。不这样做时 Nav2 autostart 会在 global_costmap 激活阶段
+    # 等 map->base_link 等到超时，planner_server 停在 inactive。
+    set_initial_pose: true
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
 
 bt_navigator:
   ros__parameters:
@@ -139,8 +158,13 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      # 导航的终点直接决定机械臂能不能抓到方块：0.25 m 的默认容差让底盘
+      # 在离目标 25 cm 处就“到达”，方块落到腕部相机 0.75 m 外，顶面测量
+      # 和近距离复检都会失败（实测一次抓取因此把底盘顶退了 22 cm）。
+      # 0.05 m 对应 standoff 0.50 m ± 5 cm，仍在视觉抓取的 0.45-0.55 m
+      # 工作范围内。
+      xy_goal_tolerance: 0.05
+      yaw_goal_tolerance: 0.10
     # DWB parameters
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
@@ -168,7 +192,9 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.2
-      xy_goal_tolerance: 0.25
+      # 与 general_goal_checker 保持一致，否则 DWB 会提前把目标点当作
+      # 已到达并停止打分。
+      xy_goal_tolerance: 0.05
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
