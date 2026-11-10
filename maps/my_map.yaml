@@ -4,10 +4,25 @@
 # walls are 0.1 m thick, centred on x/y = +/-4, so their inner faces are at
 # +/-3.95 and their outer faces at +/-4.05. Each wall is exactly two cells
 # wide in this grid (columns/rows 166-167), the room interior is free down to
-# the inner faces, and the 0.30 m strip outside the walls is unknown. The two
-# boxes sit at (1.5, 1.0) and (-1.5, -1.5), so AMCL's correct initial pose is
-# (0, 0, 0) -- see config/nav2_params.yaml. test/test_map_assets.py checks
-# this alignment against demo.world.
+# the inner faces, and the 0.30 m strip outside the walls is unknown.
+#
+# The static long table grasp_table is centred at (1.45, 0) and its
+# 0.60 x 2.00 m footprint (x in [1.15, 1.75], y in [-1.0, 1.0]) is occupied.
+# The obstruction boxes are at (1.5, 2.5) and (-1.5, -1.5). The red grasp
+# cube is spawned at runtime, so it is deliberately not in the map.
+#
+# Current counts: occupied 2004 / free 24240 / unknown 4032.
+# AMCL's correct initial pose is (0, 0, 0) -- see config/nav2_params.yaml.
+# test/test_map_assets.py checks this alignment against demo.world.
+#
+# A fresh SLAM run against this world was also tried. With the
+# differential-drive /odom the map was rotated (in-place turns slip), and
+# with Gazebo's ground-truth odometry Karto's scan matching still skewed the
+# room by about 1 degree. Turning scan matching off produced a consistent
+# grid, but slam_toolbox cropped it at the wall inner faces and its origin
+# was offset from the world grid by up to 3 cm. Neither result matches the
+# exact wall alignment AMCL is tuned for, so the asset remains generated
+# from the world geometry.
 #
 # The previous file was a SLAM trace whose room was rotated ~52 degrees
 # against the world and contained two overlapping wall outlines; AMCL

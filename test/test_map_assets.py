@@ -13,7 +13,13 @@ from my_robot_sim.grasp_box import (
     table_dimensions,
     table_pose,
 )
-from my_robot_sim.search_and_grasp import STANDOFF_DISTANCE
+from my_robot_sim.search_and_grasp import (
+    NAV_GOAL_CLEARANCE,
+    NAV_GOAL_RETREAT_STEPS,
+    STANDOFF_DISTANCE,
+    clearance_violation,
+    standoff_goal,
+)
 
 PKG_ROOT = os.path.join(os.path.dirname(__file__), '..')
 MAP_YAML = os.path.join(PKG_ROOT, 'maps', 'my_map.yaml')
@@ -123,6 +129,100 @@ def test_world_obstacle_does_not_overlap_the_table():
     assert separated(0) or separated(1), 'box_1 overlaps the table'
 
 
+def test_map_contains_the_table_and_boxes():
+    """
+    The new table must be occupied in the map Nav2 and AMCL load.
+
+    Without it the planner would happily route the base through the table,
+    and AMCL would score every lidar return from the table as a mismatch.
+    The cube is spawned at runtime, so it is intentionally absent.
+    """
+    info = load_map_info()
+    image = read_pgm(os.path.join(os.path.dirname(MAP_YAML), info['image']))
+    for y in np.linspace(-0.9, 0.9, 7):
+        for x in (1.20, 1.45, 1.70):
+            assert map_pixel(image, info, x, y) == 0, (
+                'table footprint at (%.2f, %.2f) is not occupied' % (x, y))
+        assert map_pixel(image, info, 1.10, y) == 254, (
+            'space west of the table is not free')
+    for name in ('box_1', 'box_2'):
+        pose, _ = read_world_box(name)
+        assert map_pixel(image, info, pose[0], pose[1]) == 0, (
+            '%s is not occupied in the map' % name)
+
+
+def test_lateral_observation_goals_are_free_in_the_map():
+    """
+    Left / centre / right cube positions must all leave the goal free.
+
+    ``standoff_goal`` puts the goal on the line from the cube to the robot,
+    so a cube at y = +/-0.6 m gives a diagonal approach that runs close to
+    the table's front face. Run the same check search_and_grasp runs, with
+    the real map and the real clearance, instead of approximating it with
+    separately rounded cell offsets.
+    """
+    config = load_config(GRASP_CONFIG)
+    info = load_map_info()
+    image = read_pgm(os.path.join(os.path.dirname(MAP_YAML), info['image']))
+    grid = occupancy_grid_from_pgm(image, info)
+    for cube_y in (-0.6, 0.0, 0.6):
+        goal_x, goal_y, _ = standoff_goal(
+            (config['x'], cube_y), (0.0, 0.0), STANDOFF_DISTANCE)
+        reason = clearance_violation(
+            grid, image.shape[1], image.shape[0],
+            info['origin'][0], info['origin'][1], info['resolution'],
+            goal_x, goal_y, NAV_GOAL_CLEARANCE)
+        assert reason is None, (
+            'goal at (%.2f, %.2f) is rejected for cube y=%.1f: %s'
+            % (goal_x, goal_y, cube_y, reason))
+
+
+def test_goal_retreat_recovers_from_a_biased_cube_estimate():
+    """
+    A cube at y=-0.6 m seen obliquely was estimated at (1.539, -0.642).
+
+    That 9 cm east bias put the nominal 0.6 m standoff at x=0.99, only
+    0.16 m from the table, so the goal check refused it. Retreating along
+    the same cube->robot line by one of NAV_GOAL_RETREAT_STEPS must yield a
+    goal the check accepts, otherwise search_and_grasp would give up on a
+    perfectly graspable left/right cube.
+    """
+    info = load_map_info()
+    image = read_pgm(os.path.join(os.path.dirname(MAP_YAML), info['image']))
+    grid = occupancy_grid_from_pgm(image, info)
+    cube_xy, robot_xy = (1.5387, -0.6418), (0.09, -0.03)
+    nominal = standoff_goal(cube_xy, robot_xy, STANDOFF_DISTANCE)
+    assert clearance_violation(
+        grid, image.shape[1], image.shape[0],
+        info['origin'][0], info['origin'][1], info['resolution'],
+        nominal[0], nominal[1], NAV_GOAL_CLEARANCE) is not None
+    candidates = [
+        standoff_goal(cube_xy, robot_xy, STANDOFF_DISTANCE + extra)
+        for extra in NAV_GOAL_RETREAT_STEPS]
+    reasons = [
+        clearance_violation(
+            grid, image.shape[1], image.shape[0],
+            info['origin'][0], info['origin'][1], info['resolution'],
+            goal[0], goal[1], NAV_GOAL_CLEARANCE)
+        for goal in candidates]
+    assert reasons[-1] is None, reasons
+
+
+def test_lateral_goal_beyond_the_table_reach_is_rejected():
+    """A cube near the table's end must not put the goal inside the table."""
+    config = load_config(GRASP_CONFIG)
+    info = load_map_info()
+    image = read_pgm(os.path.join(os.path.dirname(MAP_YAML), info['image']))
+    grid = occupancy_grid_from_pgm(image, info)
+    goal_x, goal_y, _ = standoff_goal(
+        (config['x'], 0.75), (0.0, 0.0), STANDOFF_DISTANCE)
+    reason = clearance_violation(
+        grid, image.shape[1], image.shape[0],
+        info['origin'][0], info['origin'][1], info['resolution'],
+        goal_x, goal_y, NAV_GOAL_CLEARANCE)
+    assert reason == '附近有墙壁或障碍物'
+
+
 def test_demo_world_is_valid_sdf():
     """演示世界必须是合法 SDF，且包含墙和障碍物."""
     root = ET.parse(DEMO_WORLD).getroot()
@@ -133,6 +233,16 @@ def test_demo_world_is_valid_sdf():
     assert len(models) >= 5, '演示世界至少要有四面墙和两个障碍物'
     for model in models:
         assert model.find('link') is not None
+
+
+def occupancy_grid_from_pgm(image, info):
+    """把 PGM 转成 map_server 按本 yaml 阈值发布的 OccupancyGrid.data."""
+    occupancy = (255.0 - image.astype(np.float64)) / 255.0
+    data = np.where(
+        occupancy > info['occupied_thresh'], 100,
+        np.where(occupancy < info['free_thresh'], 0, -1))
+    # OccupancyGrid 的行从 origin 角落向上增长，PGM 第 0 行在地图上方。
+    return data[::-1].reshape(-1)
 
 
 def read_pgm(path):
