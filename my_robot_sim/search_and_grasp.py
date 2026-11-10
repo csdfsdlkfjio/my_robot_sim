@@ -12,8 +12,10 @@ Stages:
                   and re-aim the wrist camera at the cube estimate;
     3. grasp    - run the visual-grasp sequence (VisualGraspNode) on the
                   settled base;
-    4. retry    - back away 20 cm, drive back to the standoff and run the
-                  grasp once more if it failed.
+    4. retry    - fold the arm home, back away 20 cm, drive back to the
+                  standoff and run the grasp once more if it failed. Folding
+                  first keeps the failed grasp's open gripper from dragging
+                  the cube away as the base reverses.
 
 Why the camera and not the lidar: lidar_link sits 5 cm above base_link, which
 is 0.20 m high, so the scan plane is at z ~= 0.25 m -- it grazes the cube
@@ -776,6 +778,13 @@ class SearchAndGraspNode(VisualGraspNode):
             self.get_logger().warning(
                 '抓取失败，后退 %.0f cm 后重新导航到方块前再试一次 ...'
                 % (RETREAT_DISTANCE * 100.0))
+            # The failed grasp leaves the gripper down around the cube.
+            # Backing the base off now would drag the pads through it and
+            # knock it over, so the retry has to start by folding the arm.
+            self.get_logger().info('后退前先收起机械臂 ...')
+            if not self.send_home_trajectory():
+                self.get_logger().error('后退前回 Home 失败')
+                return False
             if not self.retreat():
                 self.get_logger().error('后退失败，无法重试抓取')
                 return False

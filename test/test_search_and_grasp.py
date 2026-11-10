@@ -198,6 +198,12 @@ def test_run_order_is_search_then_navigate_then_grasp():
     # camera is too far to measure the cube reliably.
     assert grasp < retreat
     assert 'self.navigate_to_cube(cube_xy)' in run[retreat:]
+    # Retreating with the arm still down at the cube drags the gripper
+    # through it and knocks the cube over (seen live: the cube flew 2 m and
+    # the retry's bogus measurement tipped the robot). Fold the arm first.
+    retry = run[run.index('抓取失败，后退'):]
+    assert retry.index('self.send_home_trajectory()') < retry.index(
+        'self.retreat()')
 
 
 def test_search_uses_the_camera_not_the_lidar():
