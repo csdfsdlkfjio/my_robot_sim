@@ -73,6 +73,7 @@ from my_robot_sim.mobile_manipulation_node import (
     squeeze_outcome,
     squeeze_seat_window,
     tcp_hand_position,
+    wait_for_pad_motion,
 )
 
 
@@ -504,6 +505,60 @@ def test_gripper_stuck_open_separates_a_dead_command_from_the_cube():
     assert not gripper_stuck_open((0.0, 0.0), 0.025)
     # A goal within 2 mm of the stop is not judged: there is no travel to lose.
     assert not gripper_stuck_open((0.0399, 0.0399), 0.0395)
+
+
+def test_wait_for_pad_motion_tolerates_a_late_controller():
+    """
+    Measured: the pre-close goal returned while both pads still read 0.0394.
+
+    A single read after 0.2 s called a working controller dead. The helper
+    must keep reading until the pads leave the open stop.
+    """
+    reads = [(0.0394, 0.0394)] * 8 + [(0.0350, 0.0350)]
+    state = {'i': 0, 't': 0.0}
+
+    def read():
+        value = reads[min(state['i'], len(reads) - 1)]
+        state['i'] += 1
+        return value
+
+    def sleep(seconds):
+        state['t'] += seconds
+
+    positions = wait_for_pad_motion(
+        read, 0.035, timeout=3.0, poll=0.05,
+        clock=lambda: state['t'], sleep=sleep)
+    assert positions == pytest.approx((0.0350, 0.0350))
+    # It waited for the motion instead of accepting the first read.
+    assert state['i'] > 8
+
+
+def test_wait_for_pad_motion_gives_up_on_a_dead_command_path():
+    """A controller that never moves must still report the open stop."""
+    reads = [(0.0399, 0.0398)]
+    state = {'t': 0.0}
+
+    positions = wait_for_pad_motion(
+        lambda: reads[0], 0.031, timeout=1.0, poll=0.05,
+        clock=lambda: state['t'],
+        sleep=lambda seconds: state.__setitem__('t', state['t'] + seconds))
+    assert positions == pytest.approx((0.0399, 0.0398))
+    assert state['t'] == pytest.approx(1.0)
+
+
+def test_wait_for_pad_motion_returns_immediately_when_the_pads_moved():
+    """The common case must not add any wait to the grasp."""
+    calls = {'n': 0}
+
+    def read():
+        calls['n'] += 1
+        return (0.0360, 0.0360)
+
+    positions = wait_for_pad_motion(
+        read, 0.035, timeout=3.0, clock=lambda: 0.0,
+        sleep=lambda seconds: pytest.fail('must not sleep'))
+    assert positions == pytest.approx((0.0360, 0.0360))
+    assert calls['n'] == 1
 
 
 def test_both_grasp_sequences_verify_the_pre_close_position():

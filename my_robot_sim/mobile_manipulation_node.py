@@ -173,8 +173,12 @@ PRE_CLOSE_MARGIN = 0.004  # m between the nearest pad and the cube face
 # error ate the whole PRE_CLOSE_MARGIN and nearly doubled the press travel, so
 # the 10 N landed on the 50 g cube as an impact instead of seating on it.
 GRIPPER_GOAL_TOLERANCE = 0.001  # m
-# Let the joint states catch up with an executed pre-close before reading them.
-PRE_CLOSE_SETTLE = 0.2  # s
+# A pre-close goal can be reported as executed before the joint states move:
+# measured live, both pads still read the open stop 0.4 s after the goal and
+# only closed about two seconds later. Read once after a fixed settle and a
+# working controller looks dead, so keep polling for this long.
+PRE_CLOSE_MOVE_TIMEOUT = 3.0  # s
+PRE_CLOSE_POLL = 0.05  # s between finger-position reads while waiting
 # Readback error above this is logged: it becomes the length of the force
 # press that follows, so it is worth seeing in the log.
 PRE_CLOSE_VERIFY_TOLERANCE = 0.002  # m
@@ -337,6 +341,29 @@ def gripper_stuck_open(positions, target,
     """
     return (min(positions) >= GRIPPER_OPEN - float(tolerance)
             and float(target) <= GRIPPER_OPEN - float(min_travel))
+
+
+def wait_for_pad_motion(read_positions, target,
+                        timeout=PRE_CLOSE_MOVE_TIMEOUT,
+                        poll=PRE_CLOSE_POLL,
+                        clock=time.monotonic,
+                        sleep=time.sleep):
+    """
+    Read the finger positions until the pads leave the open stop.
+
+    The pre-close goal and the joint states are not synchronised: a goal
+    reported as executed can still show both pads on the open stop for a
+    moment. Waiting for the pads to move costs nothing when the controller is
+    prompt (the first read already shows motion) and turns the measured
+    late-execution case into a success instead of a false failure.
+    """
+    positions = read_positions()
+    deadline = clock() + timeout
+    while positions is not None and gripper_stuck_open(positions, target) \
+            and clock() < deadline:
+        sleep(poll)
+        positions = read_positions()
+    return positions
 
 
 def squeeze_seat_window(size, tolerance=SQUEEZE_CONTACT_TOLERANCE,
@@ -1099,6 +1126,11 @@ class MobileManipulationNode(Node):
             return None
         return [positions[name] for name in HAND_JOINTS]
 
+    def read_finger_positions_once(self, poll=PRE_CLOSE_POLL):
+        """Spin once so a fresh joint state arrives, then read the fingers."""
+        rclpy.spin_once(self, timeout_sec=poll)
+        return self.finger_positions()
+
     def switch_controllers(self, activate, deactivate, timeout=15.0):
         """Strictly swap which controller owns the finger command interfaces."""
         if not self.switch_client.wait_for_service(timeout_sec=timeout):
@@ -1190,8 +1222,8 @@ class MobileManipulationNode(Node):
         for attempt in range(1, PRE_CLOSE_ATTEMPTS + 1):
             if not self.send_move_goal(make_gripper_goal(position)):
                 return False
-            self._spin_for(PRE_CLOSE_SETTLE)
-            positions = self.finger_positions()
+            positions = wait_for_pad_motion(
+                self.read_finger_positions_once, position)
             if positions is None:
                 self.get_logger().warning(
                     '预闭合后没有收到夹爪关节状态，无法核对两指位置。')
