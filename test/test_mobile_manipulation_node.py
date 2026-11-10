@@ -36,6 +36,8 @@ from my_robot_sim.mobile_manipulation_node import (
     ODOM_FRAME,
     PRE_CLOSE_CLEARANCE,
     PRE_CLOSE_MARGIN,
+    SQUEEZE_CONTACT_TOLERANCE,
+    SQUEEZE_SEAT_PENETRATION,
     TOUCH_LINKS,
     cube_diagonal,
     default_grasp_config_path,
@@ -69,6 +71,7 @@ from my_robot_sim.mobile_manipulation_node import (
     quaternion_multiply,
     rotate_vector,
     squeeze_outcome,
+    squeeze_seat_window,
     tcp_hand_position,
 )
 
@@ -165,6 +168,32 @@ def test_squeeze_outcome_recognizes_a_missed_cube():
 def test_squeeze_outcome_reports_an_unknown_blockage():
     """A gap that is neither the width nor the diagonal is still useful."""
     assert squeeze_outcome((0.018, 0.017), 0.05) == 'blocked'
+
+
+def test_squeeze_outcome_accepts_the_measured_seat_depth():
+    """
+    Every live seat left the gap at 0.0440-0.0443 m for the 0.05 m cube.
+
+    Those runs squeezed for the whole 10 N press, so the pads really were on
+    the cube; the gap is short of the cube width because ODE lets the pads
+    sink in. The old window started at 0.0440 m, so the margin was zero and a
+    slightly deeper seat would have thrown the grasp away as 'blocked'.
+    """
+    assert squeeze_outcome((0.0221, 0.0220), 0.05) == 'held'
+    assert squeeze_outcome((0.0219, 0.0218), 0.05) == 'held'
+
+
+def test_squeeze_seat_window_only_widens_the_low_side():
+    """Penetration may shorten the gap; nothing may widen it past tolerance."""
+    low, high = squeeze_seat_window(0.05)
+    assert low == pytest.approx(
+        0.05 - 2.0 * (SQUEEZE_CONTACT_TOLERANCE + SQUEEZE_SEAT_PENETRATION))
+    assert high == pytest.approx(
+        0.05 + 2.0 * SQUEEZE_CONTACT_TOLERANCE)
+    # Still far below the corner grip, so a rotated cube stays detectable.
+    assert high < cube_diagonal(0.05) - 2.0 * SQUEEZE_CONTACT_TOLERANCE
+    # A pad that reached the middle of the cube is not a face grip either.
+    assert not pads_hold_a_cube((0.018, 0.018), 0.05)
 
 
 def test_effort_command_presses_both_fingers_inward():

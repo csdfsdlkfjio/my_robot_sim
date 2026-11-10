@@ -190,6 +190,14 @@ PRE_CLOSE_MIN_TRAVEL = 0.002  # m
 # when it needs more time.
 SQUEEZE_TIMEOUT = 5.0  # s
 SQUEEZE_CONTACT_TOLERANCE = 0.003  # m; pads must rest on the cube faces
+# The pads sink into the cube before ODE balances the 10 N press: every
+# measured seat left the pad gap at 0.0440-0.0443 m for the 0.05 m cube, i.e.
+# exactly the old lower bound. Allow the measured penetration on the low side
+# so a slightly deeper seat does not discard a valid grasp.
+SQUEEZE_SEAT_PENETRATION = 0.003  # m of extra gap loss below the cube width
+# How many presses to try when one never moved the pads off the open stop.
+# The retry re-activates the effort controller first.
+SQUEEZE_ATTEMPTS = 2
 # How long to let the pads settle after the weld releases the squeeze. The
 # effort controller keeps its last command, so without this the 10 N press
 # keeps driving the pad into the now rigidly attached cube.
@@ -318,7 +326,7 @@ def gripper_stuck_open(positions, target,
                        tolerance=GRIPPER_OPEN_TOLERANCE,
                        min_travel=PRE_CLOSE_MIN_TRAVEL):
     """
-    True when a closing command left both pads against the open stop.
+    Return True when a closing command left both pads on the open stop.
 
     ``target`` is the finger value the command asked for. A goal that is
     planned but never applied leaves the pads at 0.04 m (measured: a whole
@@ -331,7 +339,22 @@ def gripper_stuck_open(positions, target,
             and float(target) <= GRIPPER_OPEN - float(min_travel))
 
 
-def pads_hold_a_cube(positions, size, tolerance=SQUEEZE_CONTACT_TOLERANCE):
+def squeeze_seat_window(size, tolerance=SQUEEZE_CONTACT_TOLERANCE,
+                        penetration=SQUEEZE_SEAT_PENETRATION):
+    """
+    Pad-gap range that counts as resting on two opposite cube faces.
+
+    The high side is the face-grip tolerance for a cube that sits slightly
+    off-centre. The low side also allows the measured penetration of the pads
+    into the cube under the 10 N press.
+    """
+    half = float(tolerance)
+    return (float(size) - 2.0 * (half + float(penetration)),
+            float(size) + 2.0 * half)
+
+
+def pads_hold_a_cube(positions, size, tolerance=SQUEEZE_CONTACT_TOLERANCE,
+                     penetration=SQUEEZE_SEAT_PENETRATION):
     """
     Return True when the pads closed on the cube instead of past it.
 
@@ -341,7 +364,8 @@ def pads_hold_a_cube(positions, size, tolerance=SQUEEZE_CONTACT_TOLERANCE):
     gap, not each finger separately. A missed grasp leaves the fingers fully
     closed and the gap near zero.
     """
-    return abs(finger_gap(positions) - float(size)) <= 2.0 * tolerance
+    low, high = squeeze_seat_window(size, tolerance, penetration)
+    return low <= finger_gap(positions) <= high
 
 
 def cube_diagonal(size):
@@ -349,7 +373,8 @@ def cube_diagonal(size):
     return float(size) * math.sqrt(2.0)
 
 
-def squeeze_outcome(positions, size, tolerance=SQUEEZE_CONTACT_TOLERANCE):
+def squeeze_outcome(positions, size, tolerance=SQUEEZE_CONTACT_TOLERANCE,
+                    penetration=SQUEEZE_SEAT_PENETRATION):
     """
     Classify why the squeeze stopped where it did.
 
@@ -361,7 +386,7 @@ def squeeze_outcome(positions, size, tolerance=SQUEEZE_CONTACT_TOLERANCE):
     link, or a stuck finger).
     """
     gap = finger_gap(positions)
-    if abs(gap - float(size)) <= 2.0 * tolerance:
+    if pads_hold_a_cube(positions, size, tolerance, penetration):
         return 'held'
     if abs(gap - cube_diagonal(size)) <= 2.0 * tolerance:
         return 'corners'
@@ -1195,45 +1220,102 @@ class MobileManipulationNode(Node):
             % (positions[0], positions[1], position))
         return False
 
-    def squeeze_gripper(self):
-        """Press the cube with a constant force and verify the pads touch it."""
-        size = self.grasp['size']
-        effort = self.grasp['squeeze_effort']
-        if not self.switch_controllers(
-                activate=[HAND_EFFORT_CONTROLLER],
-                deactivate=[HAND_POSITION_CONTROLLER]):
-            return False
+    def press_until_seated(self, command, size, timeout=SQUEEZE_TIMEOUT):
+        """
+        Publish ``command`` until the pads hold the cube or ``timeout`` ends.
 
-        command = make_effort_command(effort)
-        deadline = time.monotonic() + SQUEEZE_TIMEOUT
+        Returns the last finger positions seen (None when no joint states
+        arrived). The caller checks them: after a press that ends on the open
+        stop the pads never moved at all, which is a different failure from a
+        cube that stopped them part way.
+        """
         positions = None
+        deadline = time.monotonic() + timeout
         while rclpy.ok() and time.monotonic() < deadline:
             self.hand_effort_pub.publish(command)
             rclpy.spin_once(self, timeout_sec=0.02)
             positions = self.finger_positions()
             if positions is not None and pads_hold_a_cube(positions, size):
+                break
+        return positions
+
+    def restart_effort_controller(self):
+        """
+        Re-activate the effort controller so it re-applies its command.
+
+        The effort controller is open loop and keeps its last command while
+        deactivated, so a fresh activation is a cheap way to recover the
+        command path when a press did not move the fingers at all.
+        """
+        if not self.switch_controllers(
+                activate=[HAND_POSITION_CONTROLLER],
+                deactivate=[HAND_EFFORT_CONTROLLER]):
+            return False
+        return self.switch_controllers(
+            activate=[HAND_EFFORT_CONTROLLER],
+            deactivate=[HAND_POSITION_CONTROLLER])
+
+    def squeeze_gripper(self):
+        """Press the cube with a constant force and verify the pads touch it."""
+        size = self.grasp['size']
+        effort = self.grasp['squeeze_effort']
+        command = make_effort_command(effort)
+        positions = None
+        for attempt in range(1, SQUEEZE_ATTEMPTS + 1):
+            if attempt == 1:
+                switched = self.switch_controllers(
+                    activate=[HAND_EFFORT_CONTROLLER],
+                    deactivate=[HAND_POSITION_CONTROLLER])
+            else:
+                switched = self.restart_effort_controller()
+            if not switched:
+                return False
+
+            positions = self.press_until_seated(command, size)
+            if positions is None:
+                self.get_logger().error('没有收到夹爪关节状态')
+                return False
+            if pads_hold_a_cube(positions, size):
                 self.get_logger().info(
                     '夹爪已用 %.1f N 的力夹住箱子，关节位置 (%0.4f, %0.4f) m。'
                     % (effort, positions[0], positions[1]))
                 return True
+            if not gripper_stuck_open(positions, size / 2.0):
+                break
+            # Nothing between the pads can hold them at 0.08 m: the command
+            # never reached the fingers. Try once more on a fresh activation
+            # instead of blaming the cube.
+            self.get_logger().warning(
+                '夹紧指令没有生效：%.1f s 内两指一直停在张开限位 '
+                '(%0.4f, %0.4f) m。重新激活 %s 后再夹一次（第 %d/%d 次）...'
+                % (SQUEEZE_TIMEOUT, positions[0], positions[1],
+                   HAND_EFFORT_CONTROLLER, attempt + 1, SQUEEZE_ATTEMPTS))
 
         if positions is None:
             self.get_logger().error('没有收到夹爪关节状态')
             return False
-        outcome = squeeze_outcome(positions, size)
-        if outcome == 'corners':
+        if gripper_stuck_open(positions, size / 2.0):
             detail = (
-                '两指间距接近方块的对角线（%.4f m）。这说明两指没有压在'
-                '两个对面的平面上：要么方块被碰转了约 45 度，要么方块'
-                '整体偏到夹爪一侧、一根手指压在方块的棱上。下探前必须'
-                '把方块和夹爪的中心对齐，并确认夹爪完全张开'
-                % cube_diagonal(size))
-        elif outcome == 'missed':
-            detail = '两指已完全闭合，方块不在两指之间（下探位置偏了）'
-        elif outcome == 'blocked':
-            detail = '两指被两指之间的物体挡住，间距既不是方块宽也不是对角线'
+                '两指一直停在张开限位，说明夹爪没有收到闭合力，或者控制器'
+                '没有把力加到手指上。这不是方块挡住手指：完全张开时两指'
+                '内侧面之间有 0.08 m，而方块只有 %.3f m 宽。请检查 %s 的'
+                '切换和 controller_manager 日志'
+                % (size, HAND_EFFORT_CONTROLLER))
         else:
-            detail = '夹爪没有进入夹持状态'
+            outcome = squeeze_outcome(positions, size)
+            if outcome == 'corners':
+                detail = (
+                    '两指间距接近方块的对角线（%.4f m）。这说明两指没有压在'
+                    '两个对面的平面上：要么方块被碰转了约 45 度，要么方块'
+                    '整体偏到夹爪一侧、一根手指压在方块的棱上。下探前必须'
+                    '把方块和夹爪的中心对齐，并确认夹爪完全张开'
+                    % cube_diagonal(size))
+            elif outcome == 'missed':
+                detail = '两指已完全闭合，方块不在两指之间（下探位置偏了）'
+            elif outcome == 'blocked':
+                detail = '两指被两指之间的物体挡住，间距既不是方块宽也不是对角线'
+            else:
+                detail = '夹爪没有进入夹持状态'
         self.get_logger().error(
             '%.1f s 内夹爪没有夹住箱子：关节位置 (%0.4f, %0.4f) m，'
             '两指间距 %0.4f m，箱子宽 %0.3f m。%s'
