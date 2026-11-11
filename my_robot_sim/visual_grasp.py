@@ -144,7 +144,7 @@ def stamp_seconds(stamp):
 
 
 def stamp_is_newer(stamp, reference):
-    """True when ``stamp`` was taken after ``reference`` (None = any)."""
+    """Return True when ``stamp`` was taken after ``reference`` (None = any)."""
     if stamp is None:
         return False
     if reference is None:
