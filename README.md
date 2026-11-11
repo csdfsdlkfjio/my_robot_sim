@@ -405,7 +405,7 @@ ros2 topic echo /cmd_vel              # 避障节点最终发出的速度指令
 
 ## 核心排错记录
 
-以下是本项目从"能启动"到"能稳定走正方形、能避障、能建图、能导航"过程中实际遇到并修复的九个问题，按时间顺序记录。
+以下是本项目从"能启动"到"能稳定走正方形、能避障、能建图、能导航"过程中实际遇到并修复的十个问题，按时间顺序记录。
 
 ### 1. `/odom` 和 `odom → base_link` TF 不发布
 
@@ -824,6 +824,57 @@ amcl:
 | AMCL 日志 | `Couldn't transform ... base_footprint` 刷屏 | 无该错误 |
 | `map → odom` TF | 不存在 | 给出初始位姿后存在 |
 | RViz Fixed Frame `map` | 不存在，Global Status Error | 正常 |
+
+---
+
+### 10. `/odom` 和 Gazebo 真值相差十几米，底盘停在墙外
+
+**现象**
+
+连续测试左 / 中 / 右三个位置时，导航最后卡在离目标 8 cm 左右，20 s 后
+由近目标分支接管；随后出现：
+
+```
+方块偏在底盘 80° 方向，先转正再向前挪 ...
+[ERROR] 方块在 panda_link0 下为 (-7.00, -12.29)，超出可抓范围 ...
+```
+
+同时 Gazebo 里能看到**另一个**底盘停在房间墙外。
+
+**原因**
+
+上一次的 Gazebo/launch 没有被完全关掉，或者新一次启动把机器人重复
+spawn 进了仍在运行的 Gazebo。此时同一个 ROS 域里有两个机器人：
+
+- `/odom` 和 `/ground_truth/odom` 各有两个发布者，消息交替到达；
+- 两个 gzserver 时 `/clock` 也有两个发布者；
+- 同一个 `/cmd_vel` 同时驱动两个底盘。
+
+于是 `/odom` 可能说离目标 0.11 m，而下一条真值来自墙外的旧底盘，把
+方块算到 14 m 外——8 x 8 m 的房间里，单个机器人不可能出现这个距离。
+`turn_by()` 读到的偏航也在两个机器人之间跳变，原地转正因此会拖很久。
+
+**解决**
+
+在每个终端按 Ctrl-C 停掉任务、Nav2 和仿真，确认没有残留：
+
+```bash
+pgrep -af 'gzserver|gzclient|search_and_grasp|nav2|ros2 launch'
+```
+
+没有输出后，再按顺序重新启动。启动后先确认三个话题都只有一个发布者：
+
+```bash
+ros2 topic info /odom                 # Publisher count: 1
+ros2 topic info /ground_truth/odom    # Publisher count: 1
+ros2 topic info /clock                # Publisher count: 1
+```
+
+**预防**
+
+`search_and_grasp` 启动时调用 `check_single_robot()`：上述三个话题任一
+发布者数量大于 1 就直接报错退出，不再让机械臂或底盘动作。日志会写明
+是哪个话题、有几个发布者。
 
 ---
 

@@ -865,6 +865,64 @@ def install_fake_spin(monkeypatch, node, clock, distances, tick=1.0):
         search_module.time, 'monotonic', lambda: clock[0])
 
 
+class RecordingLogger:
+    """Capture error messages for the single-robot check."""
+
+    def __init__(self):
+        self.errors = []
+
+    def info(self, message):
+        pass
+
+    def warning(self, message):
+        pass
+
+    def error(self, message):
+        self.errors.append(message)
+
+
+@pytest.mark.parametrize('duplicated', [
+    '/odom', '/ground_truth/odom', '/clock'])
+def test_single_robot_check_rejects_any_duplicated_stream(duplicated):
+    """Two robots interleave /odom, the p3d pose and the Gazebo clock."""
+    logger = RecordingLogger()
+    node = object.__new__(SearchAndGraspNode)
+    node._spin_for = lambda seconds: None
+    node.get_logger = lambda: logger
+    node.count_publishers = lambda topic: 2 if topic == duplicated else 1
+
+    assert node.check_single_robot() is False
+    assert len(logger.errors) == 1
+    assert '不止一个机器人' in logger.errors[0]
+    assert '%s 有 2 个发布者' % duplicated in logger.errors[0]
+
+
+def test_single_robot_check_accepts_a_single_gazebo():
+    """One publisher per stream is the normal, healthy bringup."""
+    node = object.__new__(SearchAndGraspNode)
+    node._spin_for = lambda seconds: None
+    node.get_logger = lambda: FakeLogger()
+    node.count_publishers = lambda topic: 1
+
+    assert node.check_single_robot() is True
+
+
+def test_run_checks_the_robot_count_before_any_motion():
+    """A duplicate robot must stop the task before the arm or base moves."""
+    node = object.__new__(SearchAndGraspNode)
+    node.get_logger = lambda: FakeLogger()
+    node.wait_for_odom = lambda: True
+    node.check_single_robot = lambda: False
+
+    def unexpected():
+        pytest.fail('the arm must not move while two robots are publishing')
+
+    node.wait_for_arm_joint_states = unexpected
+    node.send_home_trajectory = unexpected
+
+    assert node.run() is False
+
+
 def test_send_nav_goal_returns_near_after_the_endgame_timeout(monkeypatch):
     """0-0.16 m oscillation must cancel after 20 s, not wait 180 s."""
     clock = [1000.0]

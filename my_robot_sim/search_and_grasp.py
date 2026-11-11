@@ -62,6 +62,7 @@ from tf2_ros import TransformException
 from my_robot_sim.mobile_manipulation_node import (
     ARM_BASE_FRAME,
     GRIPPER_OPEN,
+    GROUND_TRUTH_TOPIC,
     ODOM_FRAME,
     TF_TIMEOUT,
     make_forward_twist,
@@ -190,6 +191,17 @@ NUDGE_ALIGN_MAX = math.radians(90.0)
 # off the map. Check the goal against map_server's own grid before sending
 # it: the goal point must be at least this far from every occupied cell.
 MAP_TOPIC = '/map'
+# One launched robot publishes each of these exactly once. Two publishers
+# mean a previous Gazebo/launch is still alive, or the model was spawned a
+# second time into a running server: /odom, the p3d pose and the Gazebo
+# clock then alternate between two robots. Live at y=-0.57 m that produced
+# /odom reporting 0.11 m to the goal while the ground-truth cube was 14 m
+# away -- farther than the 8 x 8 m room allows -- and the stale chassis was
+# being driven by the same /cmd_vel outside the wall.
+ODOM_TOPIC = '/odom'
+CLOCK_TOPIC = '/clock'
+SINGLE_ROBOT_TOPICS = (ODOM_TOPIC, GROUND_TRUTH_TOPIC, CLOCK_TOPIC)
+PUBLISHER_DISCOVERY_WAIT = 1.0  # s; let discovery see the second publisher
 # 0.22 m is the footprint radius used by both costmaps; 2 cm on top absorbs
 # the vision estimate's error. The check measures the distance from the goal
 # point to the actual cell rectangles, not to whole-cell centres: the older
@@ -592,6 +604,35 @@ class SearchAndGraspNode(VisualGraspNode):
             '"2D Pose Estimate" 给出初始位姿（在地图上点一下并拖出朝向），'
             '或者加参数 publish_initial_pose:=true 并设置 initial_x / '
             'initial_y / initial_yaw。' % (MAP_FRAME, ROBOT_FRAME))
+        return False
+
+    def check_single_robot(self):
+        """
+        Refuse to drive unless exactly one robot publishes each topic.
+
+        A stale Gazebo or a second spawn leaves two diff drives on /odom,
+        two p3d plugins on /ground_truth/odom and two clocks. The messages
+        interleave, so every distance, yaw and ground-truth pose flips
+        between two robots; no cross-check of map and odom can tell which
+        one is in front of the table, and the same /cmd_vel drives both.
+        """
+        self._spin_for(PUBLISHER_DISCOVERY_WAIT)
+        counts = {topic: self.count_publishers(topic)
+                  for topic in SINGLE_ROBOT_TOPICS}
+        duplicates = {topic: count for topic, count in counts.items()
+                      if count > 1}
+        if not duplicates:
+            return True
+        self.get_logger().error(
+            '仿真里不止一个机器人：%s。上一次的 Gazebo/launch 还活着，'
+            '或者同一个 Gazebo 里重复 spawn 了机器人：两套 /odom、/clock '
+            '和 tf 会交替出现（本次 /odom 说离目标 0.11 m，真值却把方块'
+            '算到 14 m 外，而房间只有 8 x 8 m；看到停在墙外的那个底盘也'
+            '是上一条命令留下的）。请关掉所有 terminal 里的 launch、'
+            'gzserver、gzclient 和任务节点后重新启动，并用 '
+            'ros2 topic info /odom 确认 Publisher count 是 1。'
+            % '，'.join('%s 有 %d 个发布者' % item
+                       for item in sorted(duplicates.items())))
         return False
 
     def send_initial_pose(self):
@@ -1347,6 +1388,9 @@ class SearchAndGraspNode(VisualGraspNode):
         self.get_logger().info('等待 /odom ...')
         if not self.wait_for_odom():
             self.get_logger().error('超时：没有收到 /odom')
+            return False
+        self.get_logger().info('检查仿真里是否只有一个机器人 ...')
+        if not self.check_single_robot():
             return False
         self.get_logger().info('等待 Panda 关节状态 ...')
         if not self.wait_for_arm_joint_states():
