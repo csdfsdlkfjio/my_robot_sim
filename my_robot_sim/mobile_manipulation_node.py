@@ -179,6 +179,18 @@ GRIPPER_GOAL_TOLERANCE = 0.001  # m
 # working controller looks dead, so keep polling for this long.
 PRE_CLOSE_MOVE_TIMEOUT = 3.0  # s
 PRE_CLOSE_POLL = 0.05  # s between finger-position reads while waiting
+# The pre-close is a direct JointTrajectoryController goal, not a MoveIt goal.
+# MoveIt's hand plan has no useful collision check here (the cube object is
+# removed just before closing) and its JTC goal can report "Goal reached"
+# while the fingers are still within the controller's 1 cm goal tolerance:
+# live at y=+0.6 m the target was 0.0299 m, the open stop 0.0394 m (9.5 mm
+# away), and the JTC declared success in 0.27 s without moving a finger.
+# Three position reads over 3 s then saw the open stop and the grasp aborted
+# with "预闭合没有生效" even though the controller had accepted the goal.
+# A direct trajectory with an explicit duration moves the pads and the
+# position readback below verifies where they really stopped.
+HAND_TRAJECTORY_ACTION = '/panda_hand_controller/follow_joint_trajectory'
+PRE_CLOSE_MOVE_DURATION = 0.5  # s for the direct finger trajectory
 # Readback error above this is logged: it becomes the length of the force
 # press that follows, so it is worth seeing in the log.
 PRE_CLOSE_VERIFY_TOLERANCE = 0.002  # m
@@ -661,6 +673,17 @@ def make_home_trajectory(duration=HOME_DURATION):
     return goal
 
 
+def make_gripper_trajectory(position, duration=PRE_CLOSE_MOVE_DURATION):
+    """Direct JTC goal that moves both fingers to ``position``."""
+    goal = FollowJointTrajectory.Goal()
+    goal.trajectory.joint_names = list(HAND_JOINTS)
+    point = JointTrajectoryPoint()
+    point.positions = [float(position), float(position)]
+    point.time_from_start = Duration(seconds=float(duration)).to_msg()
+    goal.trajectory.points = [point]
+    return goal
+
+
 def make_reach_goal(position, quaternion=GRIPPER_DOWN):
     """Move the hand to ``position`` with the gripper pointing down."""
     constraints = Constraints(
@@ -816,6 +839,8 @@ class MobileManipulationNode(Node):
         self.move_client = ActionClient(self, MoveGroup, '/move_action')
         self.arm_client = ActionClient(
             self, FollowJointTrajectory, ARM_TRAJECTORY_ACTION)
+        self.hand_client = ActionClient(
+            self, FollowJointTrajectory, HAND_TRAJECTORY_ACTION)
         self.cartesian_client = self.create_client(
             GetCartesianPath, CARTESIAN_SERVICE)
         self.execute_client = ActionClient(
@@ -1048,6 +1073,49 @@ class MobileManipulationNode(Node):
             return False
         return True
 
+    def send_hand_trajectory(self, position, timeout=MOVE_TIMEOUT):
+        """
+        Move both fingers through the position JTC and wait for the result.
+
+        Unlike a MoveIt goal, the trajectory carries an explicit duration, so
+        the controller starts moving immediately. The caller still checks the
+        joint readback: the action result says the pads reached the commanded
+        value, not where the grasp left them.
+        """
+        if not self.hand_client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error(
+                '没有找到 %s' % HAND_TRAJECTORY_ACTION)
+            return False
+
+        send_future = self.hand_client.send_goal_async(
+            make_gripper_trajectory(position))
+        rclpy.spin_until_future_complete(
+            self, send_future, timeout_sec=timeout)
+        if not send_future.done():
+            self.get_logger().error('发送夹爪轨迹超时')
+            return False
+
+        handle = send_future.result()
+        if handle is None or not handle.accepted:
+            self.get_logger().error('夹爪控制器拒绝了预闭合轨迹')
+            return False
+
+        result_future = handle.get_result_async()
+        rclpy.spin_until_future_complete(
+            self, result_future,
+            timeout_sec=PRE_CLOSE_MOVE_DURATION + timeout)
+        if not result_future.done():
+            self.get_logger().error('等待夹爪轨迹执行结果超时')
+            handle.cancel_goal_async()
+            return False
+
+        status = result_future.result().status
+        if status != GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().error(
+                '预闭合轨迹执行失败，status=%d' % status)
+            return False
+        return True
+
     def send_move_goal(self, goal, timeout=MOVE_TIMEOUT):
         """Send a MoveGroup goal and wait for execution to finish."""
         for attempt in range(1, MOVE_ATTEMPTS + 1):
@@ -1252,16 +1320,16 @@ class MobileManipulationNode(Node):
         """
         Move the pads to ``position`` and verify where they really stopped.
 
-        The joint states decide, not the goal result: MoveIt plans within
-        GRIPPER_GOAL_TOLERANCE and the hand JTC accepts a 1 cm per-joint goal
-        error, so a reported success can still leave the pads millimetres from
-        the requested value. That gap is press travel (and impact speed) for
-        the force squeeze that follows, so it is measured and logged, and a
-        goal that never moved the pads off the open stop is sent once more.
+        The joint states decide, not the goal result: the hand JTC accepts a
+        1 cm per-joint goal error, so a reported success can still leave the
+        pads millimetres from the requested value. That gap is press travel
+        (and impact speed) for the force squeeze that follows, so it is
+        measured and logged, and a goal that never moved the pads off the
+        open stop is sent once more.
         """
         positions = None
         for attempt in range(1, PRE_CLOSE_ATTEMPTS + 1):
-            if not self.send_move_goal(make_gripper_goal(position)):
+            if not self.send_hand_trajectory(position):
                 return False
             positions = wait_for_pad_motion(
                 self.read_finger_positions_once, position)

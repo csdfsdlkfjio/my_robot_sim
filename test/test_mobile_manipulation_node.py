@@ -36,6 +36,7 @@ from my_robot_sim.mobile_manipulation_node import (
     ODOM_FRAME,
     PRE_CLOSE_CLEARANCE,
     PRE_CLOSE_MARGIN,
+    PRE_CLOSE_MOVE_DURATION,
     SQUEEZE_CONTACT_TOLERANCE,
     SQUEEZE_SEAT_PENETRATION,
     TOUCH_LINKS,
@@ -52,6 +53,7 @@ from my_robot_sim.mobile_manipulation_node import (
     make_effort_command,
     make_forward_twist,
     make_gripper_goal,
+    make_gripper_trajectory,
     make_home_trajectory,
     make_open_effort_command,
     make_pose,
@@ -471,6 +473,27 @@ def test_gripper_goal_commands_both_fingers_symmetrically():
     assert positions == [GRIPPER_OPEN, GRIPPER_OPEN]
 
 
+def test_gripper_trajectory_moves_both_fingers_with_a_duration():
+    """
+    The pre-close goes straight to the hand JTC with an explicit duration.
+
+    Measured live at y=+0.6 m: a MoveIt hand goal for 0.0299 m starting from
+    the 0.0394 m open stop (9.5 mm of travel) was accepted and declared
+    "Goal reached, success!" after 0.27 s without moving a finger, because
+    the JTC's 1 cm goal tolerance already covered the target. A trajectory
+    with an explicit duration is executed point by point instead.
+    """
+    assert PRE_CLOSE_MOVE_DURATION > 0.0
+    goal = make_gripper_trajectory(0.0299)
+    assert list(goal.trajectory.joint_names) == list(HAND_JOINTS)
+    assert len(goal.trajectory.points) == 1
+    point = goal.trajectory.points[0]
+    assert list(point.positions) == [0.0299, 0.0299]
+    duration = (point.time_from_start.sec
+                + point.time_from_start.nanosec * 1e-9)
+    assert duration == pytest.approx(PRE_CLOSE_MOVE_DURATION)
+
+
 def test_gripper_goal_is_planned_within_a_millimetre():
     """
     A loose goal tolerance eats the pre-close margin.
@@ -575,8 +598,16 @@ def test_both_grasp_sequences_verify_the_pre_close_position():
         with open(path, encoding='utf-8') as handle:
             source = handle.read()
         assert 'if not self.pre_close_gripper(pre_close):' in source, module
+        # The MoveIt hand goal can be swallowed by the JTC tolerance; the
+        # pre-close must not fall back to it.
         assert 'self.send_move_goal(make_gripper_goal(pre_close))' \
             not in source, module
+    path = os.path.join(
+        os.path.dirname(__file__), '..', 'my_robot_sim',
+        'mobile_manipulation_node.py')
+    with open(path, encoding='utf-8') as handle:
+        source = handle.read()
+    assert 'self.send_hand_trajectory(position)' in source, path
 
 
 def test_finger_gap_adds_both_pad_displacements():
