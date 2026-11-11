@@ -11,9 +11,13 @@ from sensor_msgs.msg import CameraInfo, Image
 
 from my_robot_sim.visual_grasp import (
     Detection,
+    MIN_VALID_DEPTH,
+    VisualGraspNode,
+    SURFACE_HEIGHT_TOLERANCE,
     backproject,
     bgr_image,
     camera_intrinsics,
+    clamp_surface_height,
     depth_from_patch,
     depth_image,
     detect_red_blob,
@@ -293,6 +297,55 @@ def test_masked_camera_points_reject_an_empty_mask():
         mask, depth, 100.0, 100.0, 2.0, 2.0, stride=1, min_points=1) is None
 
 
+def test_masked_camera_points_drop_the_gripper_and_near_surfaces():
+    """
+    The camera is 6 cm behind the gripper, so 0.06 m is the robot.
+
+    At the close look pose the gripper can fall inside the red mask through
+    depth/RGB parallax; back-projecting it would put the cube point at the
+    camera and the grasp would target the wrong place.
+    """
+    mask = np.full((4, 4), 255, dtype=np.uint8)
+    depth = np.full((4, 4), 0.5, dtype=np.float32)
+    depth[:, 0] = 0.06  # the gripper, in front of the scene
+    points = masked_camera_points(
+        mask, depth, 100.0, 100.0, 2.0, 2.0, stride=1, min_points=1)
+    assert points is not None
+    assert np.all(points[:, 2] >= MIN_VALID_DEPTH)
+    assert points.shape[0] == 12
+
+
+def test_depth_from_patch_ignores_the_gripper_depth():
+    """A patch dominated by the robot must not become a target depth."""
+    depth = np.full((9, 9), 0.35, dtype=np.float32)
+    depth[4, 4] = 0.06
+    assert depth_from_patch(depth, 4.0, 4.0, radius=1) == pytest.approx(0.35)
+    near_only = np.full((9, 9), 0.06, dtype=np.float32)
+    assert depth_from_patch(near_only, 4.0, 4.0, radius=1) is None
+
+
+def test_surface_height_is_clamped_when_the_depth_is_implausible():
+    """
+    A measurement below the table is a bad frame, not a buried cube.
+
+    Live at y=+0.6 m the back-projection put the top face at z=0.2131 m
+    world instead of 0.35 m: 13.7 cm below the table top. MoveIt then drove
+    the hand to z=0.128 m and the arm hit the table. Keep x/y, take z from
+    the known table+edge height.
+    """
+    point, error, corrected = clamp_surface_height(
+        (0.70, 0.0, 0.0531), 0.09)
+    assert corrected
+    assert error == pytest.approx(-0.0369)
+    assert point == pytest.approx((0.70, 0.0, 0.09))
+    # Normal vision noise stays untouched.
+    point, error, corrected = clamp_surface_height(
+        (0.70, 0.0, 0.10), 0.09)
+    assert not corrected
+    assert point[2] == pytest.approx(0.10)
+    assert SURFACE_HEIGHT_TOLERANCE == pytest.approx(0.03)
+
+
 def test_highest_face_center_ignores_the_side_faces():
     """The top face is flat and highest; its centre is not pulled sideways."""
     xs = np.linspace(0.420, 0.470, 21)
@@ -371,6 +424,7 @@ def test_source_name_labels_the_top_face_measurement():
     assert source_name('top') == '顶面点云'
     assert source_name('depth') == '深度图'
     assert source_name('plane') == '已知高度平面'
+    assert source_name('height') == '已知高度修正'
 
 
 def test_hand_position_moves_from_the_visible_face_to_the_cube_centre():
@@ -418,3 +472,73 @@ def test_color_image_remembers_its_header_stamp():
     assert 'self.image_stamp = message.header.stamp' in source
     assert 'def wait_for_fresh_detection' in source
     assert 'stamp_is_newer(stamp, newer_than)' in source
+
+
+class FakeLogger:
+    """Swallow the node's log calls."""
+
+    def info(self, message):
+        pass
+
+    def warning(self, message):
+        pass
+
+    def error(self, message):
+        pass
+
+
+def test_checked_surface_corrects_the_height_of_a_bad_frame():
+    """The grasp path must apply the known-height clamp to its measurement."""
+    node = object.__new__(VisualGraspNode)
+    node.get_logger = lambda: FakeLogger()
+    node.grasp = {'table_height': 0.30, 'size': 0.05, 'z': 0.325}
+    node.target_plane_height = lambda: 0.09
+
+    point, source = node.checked_surface((0.70, 0.0, 0.0531), 'top')
+    assert source == 'height'
+    assert point == pytest.approx((0.70, 0.0, 0.09))
+    # A plausible measurement keeps its depth-derived z.
+    point, source = node.checked_surface((0.70, 0.0, 0.095), 'top')
+    assert source == 'top'
+    assert point[2] == pytest.approx(0.095)
+
+
+def test_grasp_measurements_require_frames_newer_than_the_arm_move():
+    """
+    Stale colour/depth frames + current TF shift the point by the arm's move.
+
+    The grasp moved the look point from (0.58, 0, 0.42) to (0.70, 0, 0.42)
+    and measured a top face 11 cm too low: the stored images predated the
+    move. Both measurement passes must wait for new frames and fall back to
+    the known-height plane when the depth frame is stale.
+    """
+    import os
+    path = os.path.join(os.path.dirname(__file__), '..', 'my_robot_sim',
+                        'visual_grasp.py')
+    with open(path, encoding='utf-8') as handle:
+        source = handle.read()
+    measure = source[
+        source.index('    def measure_target'):
+        source.index('    def remember_surface_world')]
+    assert 'older_image = self.image_stamp' in measure
+    assert 'older_depth = self.depth_stamp' in measure
+    assert 'wait_for_fresh_detection' in measure
+    assert 'wait_for_fresh_depth' in measure
+    assert 'use_depth=use_depth' in measure
+    refine = source[
+        source.index('    def refine_target'):
+        source.index('    def run')]
+    assert 'wait_for_fresh_detection' in refine
+    assert 'wait_for_fresh_depth' in refine
+    assert 'use_depth=use_depth' in refine
+    fresh_depth = source[
+        source.index('    def wait_for_fresh_depth'):
+        source.index('    def detect_once')]
+    assert 'stamp_is_newer(self.depth_stamp' in fresh_depth
+    assert 'self.depth_stamp = message.header.stamp' in source
+    target = source[
+        source.index('    def target_point_in_arm_frame'):
+        source.index('    def checked_surface')]
+    assert 'use_depth' in target
+    assert target.count('self.checked_surface') == 3
+    assert 'def checked_surface' in source

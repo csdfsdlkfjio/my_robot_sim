@@ -76,6 +76,21 @@ MIN_BLOB_AREA = 80  # px^2; a 5 cm cube at the look pose covers thousands
 # image's mixed pixels along the cube's edges and its invalid zeros.
 DEPTH_PATCH_RADIUS = 4
 
+# The camera sits 6 cm behind the gripper, and with the gripper pointing down
+# the depth at the image centre is the gripper itself (measured 0.06 m in the
+# search pose). Any real target -- cube, table, room -- is further than this,
+# so closer samples are the robot, not the scene. At the close look pose the
+# red mask can line up with a finger or the chassis through depth/RGB
+# parallax; a 0.06 m sample would otherwise be back-projected into the arm.
+MIN_VALID_DEPTH = 0.15  # m
+
+# The cube rests on the table, so its top face has a known height: the table
+# top plus the cube edge (0.30 + 0.05 = 0.35 m here). A vision measurement
+# that disagrees with that by more than this is a depth/registration failure,
+# not a cube half-buried in the table: keep the measured x/y and take z from
+# the known height rather than driving the arm into the table.
+SURFACE_HEIGHT_TOLERANCE = 0.03  # m
+
 # The cube is seen from the side as well as from above: the colour blob
 # contains the top face and one or two side faces. Sampling the depth under
 # the blob's centroid therefore returned a point on a side face, up to 2.6 cm
@@ -128,6 +143,7 @@ SOURCE_NAMES = {
     'top': '顶面点云',
     'depth': '深度图',
     'plane': '已知高度平面',
+    'height': '已知高度修正',
 }
 
 
@@ -237,8 +253,14 @@ def scale_pixel(u, v, source_shape, target_shape):
             v * target_height / float(source_height))
 
 
-def depth_from_patch(depth, u, v, radius=DEPTH_PATCH_RADIUS):
-    """Median of the valid depths around (u, v), or None if all invalid."""
+def depth_from_patch(depth, u, v, radius=DEPTH_PATCH_RADIUS,
+                     min_depth=MIN_VALID_DEPTH):
+    """
+    Median of the valid depths around (u, v), or None if all invalid.
+
+    Samples closer than ``min_depth`` are the robot itself (the gripper sits
+    6 cm behind the camera), so they are discarded rather than averaged in.
+    """
     height, width = depth.shape[:2]
     centre_u = int(round(u))
     centre_v = int(round(v))
@@ -247,7 +269,7 @@ def depth_from_patch(depth, u, v, radius=DEPTH_PATCH_RADIUS):
     top = max(0, centre_v - radius)
     bottom = min(height, centre_v + radius + 1)
     patch = depth[top:bottom, left:right]
-    valid = patch[np.isfinite(patch) & (patch > 0.0)]
+    valid = patch[np.isfinite(patch) & (patch >= float(min_depth))]
     if valid.size == 0:
         return None
     return float(np.median(valid))
@@ -304,12 +326,15 @@ def transform_points(transform, points):
 
 
 def masked_camera_points(mask, depth, fx, fy, cx, cy, stride=TOP_FACE_STRIDE,
-                         min_points=TOP_FACE_MIN_POINTS):
+                         min_points=TOP_FACE_MIN_POINTS,
+                         min_depth=MIN_VALID_DEPTH):
     """
     Camera-frame points for the valid depth pixels inside ``mask``.
 
     A strided sample keeps the array small; the cube still contributes over a
-    thousand points at the look pose. None means there was no usable depth.
+    thousand points at the look pose. Depths closer than ``min_depth`` are the
+    gripper or the robot body and are dropped. None means there was no usable
+    depth.
     """
     height, width = depth.shape[:2]
     if mask.shape[:2] != (height, width):
@@ -324,7 +349,7 @@ def masked_camera_points(mask, depth, fx, fy, cx, cy, stride=TOP_FACE_STRIDE,
     u = (u * stride).astype(np.int64)
     v = (v * stride).astype(np.int64)
     z = np.asarray(depth[v, u], dtype=np.float64)
-    valid = np.isfinite(z) & (z > 0.0)
+    valid = np.isfinite(z) & (z >= float(min_depth))
     if int(valid.sum()) < min_points:
         return None
     u, v, z = u[valid], v[valid], z[valid]
@@ -388,6 +413,28 @@ def highest_face_center(points, tolerance=TOP_FACE_HEIGHT_TOLERANCE,
                 wanted = far_edge + towards_viewer * edge / 2.0
                 centre = centre + (wanted - float(centre @ axis)) * axis
     return (float(centre[0]), float(centre[1]), float(centre[2]))
+
+
+def clamp_surface_height(surface, expected_z,
+                         tolerance=SURFACE_HEIGHT_TOLERANCE):
+    """
+    Replace an implausible top-face height with the known cube-top height.
+
+    The cube sits on the table, so the height of its top face is known. A
+    depth/registration failure (a stale frame captured while the arm was still
+    moving, the gripper inside the mask, a depth image that is not aligned
+    with the colour image) can put the measurement centimetres below the
+    table. Driving the hand to that z crashes the arm into the table. Keep
+    the measured x/y, which still locate the cube, and return the known z.
+
+    Returns ``(point, error, corrected)`` where ``error`` is measured minus
+    expected in metres.
+    """
+    x, y, z = (float(value) for value in surface)
+    difference = z - float(expected_z)
+    if abs(difference) <= float(tolerance):
+        return (x, y, z), difference, False
+    return (x, y, float(expected_z)), difference, True
 
 
 def transform_direction(transform, direction):
@@ -459,6 +506,10 @@ class VisualGraspNode(MobileManipulationNode):
         self.image_stamp = None
         self.camera_info = None
         self.depth = None
+        # Header stamp of the stored depth frame. The colour and depth topics
+        # publish independently; at WSL2 frame rates they can be seconds
+        # apart, and either can predate the arm's move to the look pose.
+        self.depth_stamp = None
         # Cube top-face point in the world frame. The cube does not move
         # before the grasp, so this is the stable measurement; panda_link0
         # coordinates are recomputed from it whenever the base has crept.
@@ -490,6 +541,7 @@ class VisualGraspNode(MobileManipulationNode):
     def _on_depth(self, message):
         try:
             self.depth = depth_image(message)
+            self.depth_stamp = message.header.stamp
         except ValueError as error:
             self.get_logger().warning('忽略深度图：%s' % error)
 
@@ -516,6 +568,23 @@ class VisualGraspNode(MobileManipulationNode):
                 and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
         return self.depth is not None
+
+    def wait_for_fresh_depth(self, newer_than=None, timeout=DEPTH_TIMEOUT):
+        """
+        Wait for a depth frame taken after ``newer_than``.
+
+        A depth frame captured before the arm stopped belongs to a different
+        camera pose. Back-projecting it with the current TF moves the point by
+        the arm's motion -- measured live as an 11 cm height error. False
+        means the caller must fall back to the known-height plane instead of
+        trusting the old frame.
+        """
+        deadline = time.monotonic() + timeout
+        while rclpy.ok() and time.monotonic() < deadline:
+            if stamp_is_newer(self.depth_stamp, newer_than):
+                return True
+            rclpy.spin_once(self, timeout_sec=0.05)
+        return False
 
     def detect_once(self):
         """Run the colour threshold on the latest image."""
@@ -626,7 +695,8 @@ class VisualGraspNode(MobileManipulationNode):
         return rotate_vector(
             self.orientation_in_arm_frame(GRIPPER_DOWN), (0.0, 1.0, 0.0))
 
-    def target_point_in_arm_frame(self, detection, closing_axis=None):
+    def target_point_in_arm_frame(self, detection, closing_axis=None,
+                                  use_depth=True):
         """
         Return ((x, y, z) in panda_link0, source).
 
@@ -635,6 +705,9 @@ class VisualGraspNode(MobileManipulationNode):
         centre, without the side-face bias of a single centroid sample. If the
         depth is unusable, the pixel ray is intersected with the cube's known
         top-face height instead, so the grasp is still guided by the image.
+        Set ``use_depth`` to False when the stored depth frame predates the
+        arm's last move: it belongs to a different camera pose, so the pixel
+        ray plus the known height is the safer measurement.
 
         ``closing_axis`` is only passed by the grasp flow, where the gripper
         points down and its pads hide part of the top face: the measurement
@@ -651,7 +724,8 @@ class VisualGraspNode(MobileManipulationNode):
                 '超时：没有 %s -> %s 的 TF'
                 % (self.image_frame, ARM_BASE_FRAME))
 
-        if self.depth is not None and self.color_image is not None:
+        if use_depth and self.depth is not None \
+                and self.color_image is not None:
             points = masked_camera_points(
                 red_mask(self.color_image), self.depth, fx, fy, cx, cy)
             if points is not None:
@@ -661,13 +735,14 @@ class VisualGraspNode(MobileManipulationNode):
                     size=self.grasp['size'],
                     viewer=transform_point(transform, (0.0, 0.0, 0.0)))
                 if centre is not None:
-                    return centre, 'top'
+                    return self.checked_surface(centre, 'top')
 
-        depth = self.depth_at(detection.u, detection.v)
+        depth = self.depth_at(detection.u, detection.v) if use_depth else None
         if depth is not None:
             point = backproject(
                 detection.u, detection.v, depth, fx, fy, cx, cy)
-            return transform_point(transform, point), 'depth'
+            return self.checked_surface(
+                transform_point(transform, point), 'depth')
 
         origin = transform_point(transform, (0.0, 0.0, 0.0))
         direction = transform_direction(
@@ -675,7 +750,25 @@ class VisualGraspNode(MobileManipulationNode):
         point = point_on_plane(origin, direction, self.target_plane_height())
         if point is None:
             raise RuntimeError('深度无效，且像素射线与目标高度平面没有交点')
-        return point, 'plane'
+        return self.checked_surface(point, 'plane')
+
+    def checked_surface(self, point, source):
+        """Replace an implausible measured top height with the known one."""
+        try:
+            expected = self.target_plane_height()
+        except TransformException:
+            return point, source
+        corrected, error, changed = clamp_surface_height(point, expected)
+        if not changed:
+            return point, source
+        self.get_logger().warning(
+            '反投影得到的方块顶面高度 %.4f m 与已知高度 %.4f m（桌面 '
+            '%.2f m + 方块边长 %.2f m）相差 %.1f cm，深度数据不可信'
+            '（可能把夹爪或桌面当成方块，或深度图早于机械臂停稳）；'
+            '保留 x/y，按已知高度修正 z。'
+            % (point[2], expected, self.grasp['table_height'],
+               self.grasp['size'], abs(error) * 100.0))
+        return corrected, 'height'
 
     def look_at_pickup_area(self, orientation):
         """Move the wrist camera over the expected pickup spot."""
@@ -692,18 +785,29 @@ class VisualGraspNode(MobileManipulationNode):
 
         Raises RuntimeError when no red blob appears.
         """
-        detection = self.wait_for_detection()
+        # Only frames captured after this call are meaningful: earlier ones
+        # may still show the arm moving to the look pose, and using them with
+        # the current TF shifts the back-projected point by the arm's motion.
+        older_image = self.image_stamp
+        older_depth = self.depth_stamp
+        detection = self.wait_for_fresh_detection(older_image)
         if detection is None:
             raise RuntimeError(
-                '%.0f s 内没有在 %s 中找到红色方块'
+                '%.0f s 内没有在 %s 的新帧中找到红色方块'
                 % (self.detection_timeout, self.image_topic))
         self.publish_debug_image(detection)
         self.get_logger().info(
             '检测到红色方块：像素 (%0.1f, %0.1f)，面积 %0.0f px²'
             % (detection.u, detection.v, detection.area))
 
+        use_depth = self.depth is not None \
+            and self.wait_for_fresh_depth(older_depth)
+        if self.depth is not None and not use_depth:
+            self.get_logger().warning(
+                '深度图没有新帧（可能还是机械臂移动前的画面），本次不用深度图，'
+                '改用像素射线和已知方块高度。')
         point, source = self.target_point_in_arm_frame(
-            detection, self.closing_axis_in_arm_frame())
+            detection, self.closing_axis_in_arm_frame(), use_depth=use_depth)
         self.get_logger().info(
             '方块上表面在 %s 下为 (%0.4f, %0.4f, %0.4f)，来源：%s'
             % (ARM_BASE_FRAME, point[0], point[1], point[2],
@@ -742,15 +846,23 @@ class VisualGraspNode(MobileManipulationNode):
 
     def refine_target(self, previous):
         """Try a closer detection once the hand is above the cube."""
-        detection = self.wait_for_detection(REFINE_TIMEOUT)
+        older_image = self.image_stamp
+        older_depth = self.depth_stamp
+        detection = self.wait_for_fresh_detection(
+            older_image, REFINE_TIMEOUT, fresh_frames=1)
         if detection is None:
             self.get_logger().warning(
                 '近距离重新检测失败，沿用第一次测量的坐标')
             return self.compensated_surface(previous, '近距离检测失败')
 
         self.publish_debug_image(detection)
+        use_depth = self.depth is not None \
+            and self.wait_for_fresh_depth(older_depth)
+        if self.depth is not None and not use_depth:
+            self.get_logger().warning(
+                '近距离深度图没有新帧，本次不用深度图，改用像素射线和已知高度。')
         point, source = self.target_point_in_arm_frame(
-            detection, self.closing_axis_in_arm_frame())
+            detection, self.closing_axis_in_arm_frame(), use_depth=use_depth)
         pose = self.base_pose()
         if self.surface_world is not None and pose is not None:
             candidate_world = point_in_world(point, pose)
