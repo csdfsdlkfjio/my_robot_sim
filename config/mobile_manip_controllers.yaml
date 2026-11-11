@@ -65,17 +65,22 @@ panda_hand_controller:
       # This controller only opens the gripper and performs the pre-close;
       # the squeeze itself runs on panda_hand_effort_controller, so it never
       # needs to tolerate a cube blocking the fingers.
-      # Keep the goal tolerance well below the pre-close travel. With 1 cm
-      # (the old value) the open stop (0.0395 m) was within tolerance of the
-      # 0.0295 m pre-close target: the JTC declared success immediately and
-      # never moved a finger, and three resends failed the same way. The
-      # smallest pre-close travel (5 cm cube, no lateral offset) is
-      # 0.040 - 0.029 = 11 mm; 1.5 mm leaves the controller no room to call
-      # the open stop "already there".
+      # The tolerance has to satisfy two limits:
+      #   * well below the pre-close travel, otherwise the controller calls
+      #     the open stop "already there". With 1 cm (the old value) the open
+      #     stop (0.0395 m) was within tolerance of the 0.0295 m target: the
+      #     JTC declared success immediately, never moved a finger, and three
+      #     resends failed the same way. The smallest travel is
+      #     0.040 - 0.029 = 11 mm; 5 mm still forces at least 6 mm of motion.
+      #   * above the finger's real seating error. Live at y=+0.6 m the pads
+      #     stopped at (0.0321, 0.0300) against a 0.0299 m target -- 2.2 mm
+      #     short, closed by the effort squeeze that follows. A 1.5 mm goal
+      #     tolerance aborted that same pre-close (status=6, ABORTED) even
+      #     though the pads had nearly reached the cube.
       panda_finger_joint1:
-        goal: 0.0015
+        goal: 0.005
       panda_finger_joint2:
-        goal: 0.0015
+        goal: 0.005
 
 panda_hand_effort_controller:
   ros__parameters:

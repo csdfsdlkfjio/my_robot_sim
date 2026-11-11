@@ -1112,10 +1112,18 @@ class MobileManipulationNode(Node):
             handle.cancel_goal_async()
             return False
 
-        status = result_future.result().status
+        result = result_future.result()
+        status = result.status
         if status != GoalStatus.STATUS_SUCCEEDED:
+            # The JTC aborts (status=6) when its goal/path tolerance is
+            # violated; error_code tells which. 0.0321 m against a 0.0299 m
+            # target is 2.2 mm of real seating error, not a dead command.
+            error_code = getattr(result.result, 'error_code', None)
+            error_string = getattr(result.result, 'error_string', None)
             self.get_logger().error(
-                '预闭合轨迹执行失败，status=%d' % status)
+                '预闭合轨迹执行失败，status=%d，error_code=%s，%s'
+                % (status, error_code,
+                   error_string or '控制器没有给出原因'))
             return False
         return True
 
@@ -1370,11 +1378,11 @@ class MobileManipulationNode(Node):
         """
         Move the pads to ``position`` and verify where they really stopped.
 
-        The joint states decide, not the goal result: the hand JTC accepts a
-        1 cm per-joint goal error, so a reported success can still leave the
-        pads millimetres from the requested value. That gap is press travel
-        (and impact speed) for the force squeeze that follows, so it is
-        measured and logged, and a goal that never moved the pads off the
+        The joint states decide, not the goal result: the hand JTC tolerates
+        a per-joint goal error (5 mm), so a reported success can still leave
+        the pads millimetres from the requested value. That gap is press
+        travel (and impact speed) for the force squeeze that follows, so it
+        is measured and logged, and a goal that never moved the pads off the
         open stop is sent once more.
 
         The position JTC must own the finger interfaces first: if the effort
@@ -1389,6 +1397,20 @@ class MobileManipulationNode(Node):
         positions = None
         for attempt in range(1, PRE_CLOSE_ATTEMPTS + 1):
             if not self.send_hand_trajectory(position):
+                # The JTC aborts when the pads miss the goal by more than its
+                # tolerance. Report where they actually stopped: this is the
+                # difference between "the command never reached the fingers"
+                # and "the pads seated a couple of millimetres short of the
+                # requested pre-close", which the force squeeze can close.
+                positions = self.finger_positions()
+                if positions is not None:
+                    error = max(
+                        abs(value - position) for value in positions)
+                    self.get_logger().error(
+                        '预闭合失败时两指停在 (%0.4f, %0.4f) m，目标 %.4f m，'
+                        '最大偏差 %.1f mm。'
+                        % (positions[0], positions[1], position,
+                           error * 1000.0))
                 return False
             positions = wait_for_pad_motion(
                 self.read_finger_positions_once, position)

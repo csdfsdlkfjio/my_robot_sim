@@ -708,6 +708,33 @@ def test_pre_close_switches_the_position_controller_on_first():
     assert 'deactivate=[HAND_POSITION_CONTROLLER]' in squeeze
 
 
+def test_pre_close_failure_reports_the_controller_error_and_pad_positions():
+    """
+    An aborted pre-close must say whether the pads moved.
+
+    Live at y=+0.6 m the JTC aborted a pre-close that had nearly reached the
+    cube (status=6); without the result's error_code and the finger readback
+    the log cannot distinguish a dead command path from a few millimetres of
+    real seating error that the effort squeeze would close.
+    """
+    path = os.path.join(
+        os.path.dirname(__file__), '..', 'my_robot_sim',
+        'mobile_manipulation_node.py')
+    with open(path, encoding='utf-8') as handle:
+        source = handle.read()
+    hand = source[
+        source.index('    def send_hand_trajectory'):
+        source.index('    def send_move_goal')]
+    assert "getattr(result.result, 'error_code'" in hand
+    assert "getattr(result.result, 'error_string'" in hand
+    pre_close = source[
+        source.index('    def pre_close_gripper'):
+        source.index('    def press_until_seated')]
+    assert '预闭合失败时两指停在' in pre_close
+    assert 'self.finger_positions()' in pre_close
+    assert '最大偏差' in pre_close
+
+
 def test_both_grasp_sequences_verify_the_pre_close_position():
     """
     The pre-close must be read back instead of trusting the goal result.

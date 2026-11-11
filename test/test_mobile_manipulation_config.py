@@ -102,26 +102,33 @@ def test_hand_uses_position_and_effort_controllers():
         'panda_finger_joint1', 'panda_finger_joint2'}
 
 
-def test_hand_position_goal_tolerance_is_tighter_than_the_pre_close_travel():
+def test_hand_position_goal_tolerance_fits_between_seating_and_travel():
     """
-    The JTC must not mistake the open stop for the pre-close target.
+    The JTC tolerance must sit between real seating and the pre-close travel.
 
-    Live at y=+0.6 m the pads sat at 0.0392/0.0395 m and the target was
-    0.0295 m; with a 1 cm per-joint goal tolerance the controller reported
-    success immediately and never moved a finger, three resends included.
-    The squeeze runs on the effort controller, so the position JTC no longer
-    needs that tolerance. Keep it well below the smallest pre-close travel
-    (5 cm cube, no lateral offset: 0.040 - 0.029 = 11 mm).
+    Lower bound: live at y=+0.6 m the pads stopped at (0.0321, 0.0300) m
+    against a 0.0299 m target -- 2.2 mm short, a real settling error that
+    the effort squeeze closes. A 1.5 mm tolerance aborted that pre-close
+    with status=6 (ABORTED) after the arm had reached the cube.
+
+    Upper bound: with 1 cm (the old value) the open stop (0.0395 m) was
+    within tolerance of the 0.0295 m target, so the JTC reported success
+    without moving a finger, three resends included. The smallest travel is
+    0.040 - 0.029 = 11 mm; half of it still forces at least 6 mm of motion.
     """
     config = load_yaml(CONTROLLERS)
     constraints = config['panda_hand_controller']['ros__parameters'][
         'constraints']
     pre_close_travel = 0.040 - (0.05 / 2.0 + 0.004)
     assert pre_close_travel == pytest.approx(0.011)
+    live_target = 0.0299
+    live_pad = 0.0321
+    seating_error = live_pad - live_target
+    assert seating_error == pytest.approx(0.0022)
     for joint in ('panda_finger_joint1', 'panda_finger_joint2'):
         goal = constraints[joint]['goal']
-        assert 0.0 < goal <= 0.002, joint
-        assert goal <= pre_close_travel / 4.0, joint
+        assert goal > seating_error, joint
+        assert goal <= pre_close_travel / 2.0, joint
 
 
 def test_srdf_robot_name_matches_the_merged_urdf():
