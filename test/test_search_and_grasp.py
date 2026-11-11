@@ -26,6 +26,9 @@ from my_robot_sim.search_and_grasp import (
     NAV_GOAL_SAFE_CLEARANCE,
     NAV_NEAR_GOAL_DISTANCE,
     NAV_NEAR_GOAL_TIMEOUT,
+    NUDGE_FORWARD_ATTEMPTS,
+    NUDGE_FORWARD_DISTANCE,
+    NUDGE_FORWARD_SPEED,
     RETREAT_DISTANCE,
     SEARCH_CAMERA_TILT,
     SEARCH_DETECTION_TIMEOUT,
@@ -36,6 +39,7 @@ from my_robot_sim.search_and_grasp import (
     SearchAndGraspNode,
     clearance_violation,
     fallback_look_position,
+    forward_nudge_distance,
     make_navigate_goal,
     make_turn_twist,
     map_cell,
@@ -407,6 +411,19 @@ def test_clearance_violation_rejects_walls_obstacles_and_unknown():
         0.15, 0.15, 0.2) == '离地图边界不足'
 
 
+def test_grasp_reach_max_uses_the_pandas_real_reach():
+    """
+    The 0.70 m limit refused a cube the arm could plainly reach.
+
+    Live at the left side of the table (y=+0.6 m) the base stopped 8 cm
+    short of the standoff and measured the cube at 0.75 m in panda_link0.
+    The Panda reaches ~0.855 m to the flange and ~0.8 m practically, so
+    0.78 m keeps a little slack while no longer aborting on a reachable cube.
+    """
+    assert GRASP_REACH_MAX == pytest.approx(0.78)
+    assert GRASP_REACH_MAX < 0.80
+
+
 def test_fallback_look_position_aims_above_a_reachable_cube():
     """An off-standoff stop must still put the camera over the cube."""
     assert fallback_look_position((0.58, 0.0), 0.42) == pytest.approx(
@@ -415,6 +432,23 @@ def test_fallback_look_position_aims_above_a_reachable_cube():
         (0.34, 0.12, 0.42))
     assert fallback_look_position((0.68, -0.10), 0.42) == pytest.approx(
         (0.68, -0.10, 0.42))
+    # A cube the old 0.70 m limit refused must now be accepted.
+    assert fallback_look_position((0.76, 0.02), 0.42) == pytest.approx(
+        (0.76, 0.02, 0.42))
+
+
+def test_forward_nudge_only_fixes_a_cube_straight_ahead():
+    """Driving forward cannot help a sideways or too-close cube."""
+    assert forward_nudge_distance((0.85, 0.0)) == pytest.approx(
+        NUDGE_FORWARD_DISTANCE)
+    assert forward_nudge_distance((0.85, 0.20)) == pytest.approx(
+        NUDGE_FORWARD_DISTANCE)
+    # In reach already: no creep needed.
+    assert forward_nudge_distance((0.75, 0.0)) is None
+    # A cube to the side stays to the side no matter how far the base drives.
+    assert forward_nudge_distance((0.85, 0.35)) is None
+    # A cube behind/under the base needs a retreat, not a nudge.
+    assert forward_nudge_distance((0.20, 0.0)) is None
 
 
 def test_fallback_look_position_rejects_an_unreachable_cube():
@@ -449,12 +483,17 @@ def test_navigation_cancels_and_grasps_after_a_near_goal_timeout():
         source.index('    def navigate_to_cube'):
         source.index('    def retreat')]
     assert "status == 'near'" in navigate
-    assert 'aim_at_estimated_cube' in navigate
+    assert 'align_camera_over_cube' in navigate
     aim = source[
         source.index('    def aim_at_estimated_cube'):
         source.index('    def navigate_to_cube')]
     assert 'fallback_look_position' in aim
-    assert 'self.cube_world' in aim
+    assert 'cube_in_arm_position(cube_xy)' in aim
+    position = source[
+        source.index('    def cube_in_arm_position'):
+        source.index('    def aim_at_estimated_cube')]
+    assert 'self.cube_world' in position
+    assert 'point_in_arm_frame' in position
     assert 'self.look_position = look' in aim
     assert 'self.cube_world = point_in_world(' in source
 
@@ -464,9 +503,9 @@ def test_navigation_drives_the_last_stretch_before_the_fallback_grasp():
     Nav2 can stall a few centimetres short, which leaves the cube out of reach.
 
     Live at y=+0.6 m the base stopped 9 cm short of the standoff and 0.74 m
-    from the cube (reach limit 0.70 m), so the fallback grasp refused with
-    "超出可抓范围". After a 'near' timeout the node must drive the remaining
-    bounded stretch before aiming the camera.
+    from the cube (reach limit then 0.70 m), so the fallback grasp refused
+    with "超出可抓范围". After a 'near' timeout the node must drive the
+    remaining bounded stretch before aiming the camera.
     """
     assert 0.0 < FINISH_DISTANCE_LIMIT <= NAV_NEAR_GOAL_DISTANCE + 0.1
     assert 0.0 < FINISH_SPEED <= 0.15
@@ -481,7 +520,7 @@ def test_navigation_drives_the_last_stretch_before_the_fallback_grasp():
     near = navigate[navigate.index("status == 'near'"):]
     assert 'self.finish_standoff(goal_x, goal_y, yaw)' in near
     assert near.index('finish_standoff') < near.index(
-        'aim_at_estimated_cube')
+        'align_camera_over_cube')
     # A stateful goal checker latches at the edge of the 5 cm xy tolerance
     # and the unbraked base then drifts backwards, so SUCCEEDED can also end
     # 9 cm short. The success path must drive the same bounded remainder.
@@ -491,7 +530,7 @@ def test_navigation_drives_the_last_stretch_before_the_fallback_grasp():
     assert 'self.finish_standoff(goal_x, goal_y, yaw)' in success, (
         'a latched-but-drifted success leaves the cube out of arm reach')
     assert success.index('finish_standoff') < success.index(
-        'aim_at_estimated_cube')
+        'align_camera_over_cube')
     finish = source[
         source.index('    def map_pose_in_odom'):
         source.index('    def aim_at_estimated_cube')]
@@ -527,8 +566,48 @@ def test_navigation_reaims_the_camera_after_a_successful_goal():
     branch_end = after_near.index('return True') + len('return True')
     success = after_near[branch_end:]
     assert 'self.stop_and_settle()' in success, success
-    assert 'aim_at_estimated_cube' in success, (
+    assert 'align_camera_over_cube' in success, (
         'the success path leaves the fixed look pose pointing at empty table')
+
+
+def test_navigation_creeps_forward_when_the_cube_is_still_out_of_reach():
+    """
+    A base that stops too far away must creep forward, not abort.
+
+    Live at the left side of the table the cube was measured at 0.75 m in
+    panda_link0 after navigation -- the 0.63 m standoff plus the 4 cm arm
+    offset plus the 8 cm the base stopped short. With the limit raised to
+    0.78 m this exact case is graspable, but a worse stop must still be
+    recoverable: drive forward in 10 cm steps measured on /odom, re-aim the
+    wrist camera, and let the normal visual grasp re-detect the cube.
+    """
+    assert NUDGE_FORWARD_DISTANCE == pytest.approx(0.10)
+    assert 0.0 < NUDGE_FORWARD_SPEED <= FINISH_SPEED
+    assert NUDGE_FORWARD_ATTEMPTS >= 1
+    with open(MODULE, encoding='utf-8') as handle:
+        source = handle.read()
+    align = source[
+        source.index('    def align_camera_over_cube'):
+        source.index('    def navigate_to_cube')]
+    assert 'self.aim_at_estimated_cube(cube_xy)' in align
+    assert 'forward_nudge_distance(cube)' in align
+    assert 'self.nudge_forward(distance)' in align
+    assert align.index('forward_nudge_distance') < align.index(
+        'self.nudge_forward(distance)')
+    # Re-aim after the creep; a failed nudge must abort rather than loop.
+    assert 'if not self.nudge_forward(distance):' in align
+    nudge = source[
+        source.index('    def nudge_forward'):
+        source.index('    def align_camera_over_cube')]
+    assert 'make_forward_twist(NUDGE_FORWARD_SPEED)' in nudge
+    assert 'odom_distance' in nudge
+    assert 'stop_and_settle' in nudge
+    assert 'NUDGE_FORWARD_TIMEOUT' in nudge
+    navigate = source[
+        source.index('    def navigate_to_cube'):
+        source.index('    def retreat')]
+    assert navigate.count('align_camera_over_cube') >= 2, (
+        'both the near and the succeeded paths must nudge before aborting')
 
 
 def test_nav_feedback_tracks_the_near_goal_window():

@@ -116,9 +116,11 @@ SEARCH_SETTLE_AFTER_LOOK = 0.3  # s, lets the arm stop before the first look
 
 # Nav2 goal distance from the cube centre, squeezed between the arm and the
 # table's local costmap:
-#   * reach: the grasp refuses beyond GRASP_REACH_MAX = 0.70 m in panda_link0,
-#     which sits 4 cm behind base_link, so the base may be at most ~0.66 m
-#     from the cube (0.70 m read 0.74 m and was refused live);
+#   * reach: the grasp refuses beyond GRASP_REACH_MAX = 0.78 m in panda_link0,
+#     which sits 4 cm behind base_link, so the base may be at most ~0.74 m
+#     from the cube. The Panda's practical reach is about 0.8 m; the old
+#     0.70 m limit refused a cube measured at 0.75 m on the left side of the
+#     table, which the arm could still grasp;
 #   * costmap: the table's front face is x=1.15 and the cube x=1.455. The
 #     local costmap marks the whole band x >= 0.875 (cells at 0.90 and beyond
 #     cost 99 = inscribed obstacle) because the robot radius 0.22 plus one
@@ -142,10 +144,23 @@ NAV_NEAR_GOAL_TIMEOUT = 20.0  # s
 # The fallback grasp aims the wrist camera at the cube's estimated position
 # instead of the fixed look pose, so the base does not have to stop exactly
 # on the standoff. These bounds keep that aim inside the Panda's reach from
-# panda_link0 (0.85 m) with room for the approach.
+# panda_link0 (0.855 m to the flange; ~0.8 m practical) with room for the
+# approach. Live at the left side of the table (cube y=+0.6 m) the base
+# stopped 8 cm short of the standoff -- goal checker latches at its 5 cm xy
+# tolerance and the unbraked base drifts another few centimetres back --
+# which put the cube at 0.75 m in panda_link0. The old 0.70 m limit then
+# refused a cube the arm could plainly reach.
 GRASP_REACH_MIN = 0.30  # m ahead of the arm base
-GRASP_REACH_MAX = 0.70  # m
+GRASP_REACH_MAX = 0.78  # m
 GRASP_LATERAL_MAX = 0.25  # m to either side
+# If Nav2 still leaves the cube beyond GRASP_REACH_MAX straight ahead, do
+# not abort: drive the base forward in bounded, odometry-measured steps and
+# re-aim. A cube that is too close or too far to the side cannot be fixed
+# by driving forward, so only the straight-ahead case is nudged.
+NUDGE_FORWARD_DISTANCE = 0.10  # m per attempt
+NUDGE_FORWARD_SPEED = 0.05  # m/s, slower than FINISH_SPEED beside the table
+NUDGE_FORWARD_TIMEOUT = 8.0  # s per attempt
+NUDGE_FORWARD_ATTEMPTS = 2  # at most 20 cm of creeping
 
 # The standoff point comes from a vision estimate. If that estimate is wrong
 # the point can fall outside the room, and Nav2 would plan into the wall or
@@ -175,8 +190,8 @@ OCCUPIED_THRESHOLD = 65  # percent, equal to my_map.yaml's occupied_thresh
 # while keeping the true cube within the arm's reach.
 # 2 cm is the most the arm allows on top of 0.63: the radius is measured
 # from the cube, while the grasp measures from panda_link0, which sits
-# ARM_MOUNT_OFFSET (4 cm) behind base_link. 0.70 m at most keeps the
-# measured distance under GRASP_REACH_MAX = 0.70 m with a little slack.
+# ARM_MOUNT_OFFSET (4 cm) behind base_link. 0.65 m keeps the measured
+# distance well under GRASP_REACH_MAX = 0.78 m.
 NAV_GOAL_RETREAT_STEPS = (0.02,)
 # Retreating along the cube->base line only helps when that line is roughly
 # perpendicular to the long table. If the base was left at a shallow angle
@@ -302,10 +317,11 @@ def standoff_candidates(cube_xy, robot_xy, standoff=STANDOFF_DISTANCE):
     The nominal goal comes first, then every neighbouring bearing at the
     nominal standoff, and only then the along-line retreats. Bearing first
     matters: at y=+0.6 m the same bearing plus a 10 cm retreat was the first
-    free candidate, but 0.70 m from the cube is past the arm's reach; a
-    -15 deg bearing at the unchanged 0.60 m standoff was also free and keeps
-    the cube graspable. The caller keeps the first candidate that passes the
-    map clearance check, so the reach-preserving ones must come first.
+    free candidate, but 0.70 m from the cube was past the old 0.70 m reach
+    limit; a -15 deg bearing at the unchanged 0.60 m standoff was also free
+    and keeps the cube graspable. The caller keeps the first candidate that
+    passes the map clearance check, so the reach-preserving ones must come
+    first.
     """
     for extra in (0.0,) + NAV_GOAL_RETREAT_STEPS:
         for offset in NAV_GOAL_BEARING_OFFSETS:
@@ -330,6 +346,26 @@ def fallback_look_position(cube_in_arm, look_z):
     if abs(y) > GRASP_LATERAL_MAX:
         return None
     return (x, y, float(look_z))
+
+
+def forward_nudge_distance(cube_in_arm, reach_max=GRASP_REACH_MAX,
+                           lateral_max=GRASP_LATERAL_MAX,
+                           distance=NUDGE_FORWARD_DISTANCE):
+    """
+    Forward drive that brings a too-distant cube back into reach, or None.
+
+    Only a cube straight ahead can be fixed by driving towards it. One that
+    is already in reach, too close, or too far to the side needs no nudge
+    (or a different correction), so the caller must abort instead of blindly
+    driving into the table.
+    """
+    x = float(cube_in_arm[0])
+    y = float(cube_in_arm[1])
+    if x <= reach_max:
+        return None
+    if abs(y) > lateral_max:
+        return None
+    return float(distance)
 
 
 def map_cell(x, y, origin_x, origin_y, resolution, width, height):
@@ -840,38 +876,48 @@ class SearchAndGraspNode(VisualGraspNode):
                 self._publish_stop(0.3)
         return True
 
-    def aim_at_estimated_cube(self, cube_xy):
+    def cube_in_arm_position(self, cube_xy):
         """
-        Point the wrist camera at the cube from the stopped base.
+        Cube position in panda_link0, or (None, None) without TF.
 
         Prefers the search-time world point, which comes from ground-truth
         odometry. The map estimate carries AMCL's drift -- the very error
-        that stopped Nav2 short -- so aiming by map alone can miss the cube
-        by more than the camera's +/-8 cm view.
+        that stopped Nav2 short.
         """
-        cube = None
-        source = '地图估计'
         if self.cube_world is not None and self.base_pose() is not None:
             point = self.point_in_arm_frame(self.cube_world)
-            cube = (point.x, point.y, point.z)
-            source = '搜索时的世界坐标'
+            return (point.x, point.y, point.z), '搜索时的世界坐标'
+        transform = self.lookup_map_transform()
+        if transform is None:
+            return None, None
+        return transform_point(
+            transform, (float(cube_xy[0]), float(cube_xy[1]), 0.0)), '地图估计'
+
+    def aim_at_estimated_cube(self, cube_xy, log_error=True):
+        """
+        Point the wrist camera at the cube from the stopped base.
+
+        Returns False when the cube is out of the arm's reach; use
+        align_camera_over_cube() to try creeping forward first. Set
+        ``log_error`` to False for a trial aimed at before nudging, so the
+        log does not claim "不再盲目抓取" just before doing exactly that.
+        """
+        cube, source = self.cube_in_arm_position(cube_xy)
         if cube is None:
-            transform = self.lookup_map_transform()
-            if transform is None:
+            if log_error:
                 self.get_logger().error(
                     '没有 %s -> %s 的 TF，无法把相机对准方块'
                     % (MAP_FRAME, ARM_BASE_FRAME))
-                return False
-            cube = transform_point(
-                transform, (float(cube_xy[0]), float(cube_xy[1]), 0.0))
+            return False
         look = fallback_look_position(cube, self.look_position[2])
         if look is None:
-            self.get_logger().error(
-                '底盘停在离目标较远处，方块在 %s 下为 (%.2f, %.2f)，'
-                '超出可抓范围（x %.2f-%.2f m，|y| <= %.2f m），'
-                '不再盲目抓取。请检查 Nav2 是否能到达 standoff。'
-                % (ARM_BASE_FRAME, cube[0], cube[1], GRASP_REACH_MIN,
-                   GRASP_REACH_MAX, GRASP_LATERAL_MAX))
+            if log_error:
+                self.get_logger().error(
+                    '底盘停在离目标较远处，方块在 %s 下为 (%.2f, %.2f)，'
+                    '超出可抓范围（x %.2f-%.2f m，|y| <= %.2f m），'
+                    '不再盲目抓取。请检查 Nav2 是否能到达 standoff。'
+                    % (ARM_BASE_FRAME, cube[0], cube[1], GRASP_REACH_MIN,
+                       GRASP_REACH_MAX, GRASP_LATERAL_MAX))
             return False
         self.get_logger().warning(
             '方块当前在 %s 下为 (%.2f, %.2f)（来源：%s），把腕部相机'
@@ -881,6 +927,75 @@ class SearchAndGraspNode(VisualGraspNode):
                self.look_position[2], look[0], look[1], look[2]))
         self.look_position = look
         return True
+
+    def nudge_forward(self, distance=NUDGE_FORWARD_DISTANCE):
+        """
+        Drive ``distance`` metres straight ahead, measured on /odom.
+
+        Mirrors retreat(): Nav2 no longer commands the base and there is no
+        brake, so a bounded, odometry-measured creep is the safest way to
+        close the last few centimetres the arm is missing.
+        """
+        if self.odom is None:
+            self.get_logger().error('没有 /odom，无法向前挪动')
+            return False
+        start_xy = odom_xy(self.odom)
+        deadline = time.monotonic() + NUDGE_FORWARD_TIMEOUT
+        travelled = 0.0
+        while rclpy.ok() and time.monotonic() < deadline:
+            self.cmd_pub.publish(make_forward_twist(NUDGE_FORWARD_SPEED))
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if self.odom is None:
+                continue
+            travelled = odom_distance(start_xy, odom_xy(self.odom))
+            if travelled >= distance:
+                break
+        self.stop_and_settle()
+        if travelled < distance - 0.02:
+            self.get_logger().warning(
+                '只向前挪了 %.1f cm（目标 %.0f cm）'
+                % (travelled * 100.0, distance * 100.0))
+            return False
+        self.get_logger().info('已向前挪 %.1f cm'
+                               % (travelled * 100.0))
+        return True
+
+    def align_camera_over_cube(self, cube_xy):
+        """
+        Aim the wrist camera, creeping forward while the cube is out of reach.
+
+        Nav2 can stop short of the standoff: the stateful goal checker latches
+        at its 5 cm xy tolerance and the unbraked base drifts a few more
+        centimetres back, and beside the inflated table DWB often cannot
+        finish the last in-place rotation. At y=+0.6 m that left the cube
+        0.75 m out, the old 0.70 m limit refused it and the run aborted with
+        the cube still graspable. Drive forward 10 cm at a time (at most two
+        attempts) and re-aim; the normal visual grasp then re-detects from
+        the new pose.
+        """
+        if self.aim_at_estimated_cube(cube_xy, log_error=False):
+            return True
+        for attempt in range(1, NUDGE_FORWARD_ATTEMPTS + 1):
+            cube, source = self.cube_in_arm_position(cube_xy)
+            if cube is None:
+                self.aim_at_estimated_cube(cube_xy)
+                return False
+            distance = forward_nudge_distance(cube)
+            if distance is None:
+                self.aim_at_estimated_cube(cube_xy)
+                return False
+            self.get_logger().warning(
+                '方块在 %s 下为 (%.2f, %.2f)（来源：%s），仍超出可抓范围'
+                '（x 上限 %.2f m），向前挪 %.0f cm 后再对准（第 %d/%d 次）...'
+                % (ARM_BASE_FRAME, cube[0], cube[1], source,
+                   GRASP_REACH_MAX, distance * 100.0,
+                   attempt, NUDGE_FORWARD_ATTEMPTS))
+            if not self.nudge_forward(distance):
+                return False
+            last_attempt = attempt == NUDGE_FORWARD_ATTEMPTS
+            if self.aim_at_estimated_cube(cube_xy, log_error=last_attempt):
+                return True
+        return False
 
     def navigate_to_cube(self, cube_xy):
         """Drive to the standoff point in front of the cube."""
@@ -968,7 +1083,7 @@ class SearchAndGraspNode(VisualGraspNode):
             # standoff geometry it was tuned for, then re-aim the camera
             # using the cube estimate and let the proven visual grasp run.
             self.finish_standoff(goal_x, goal_y, yaw)
-            if not self.aim_at_estimated_cube(cube_xy):
+            if not self.align_camera_over_cube(cube_xy):
                 return False
             return True
         # SUCCEEDED does not mean the base is on the standoff. The stateful
@@ -976,9 +1091,9 @@ class SearchAndGraspNode(VisualGraspNode):
         # this base has no brake: at y=+0.6 m it latched at the 5 cm edge of
         # the xy tolerance and then drifted 5.7 cm backwards over the next
         # 20 s, finishing 9 cm short and 0.81 m from the cube -- outside the
-        # arm's 0.70 m reach, so the grasp was refused after a "successful"
-        # navigation. Drive the bounded remainder from /odom, exactly as the
-        # 'near' path does.
+        # arm's reach then (0.70 m), so the grasp was refused after a
+        # "successful" navigation. Drive the bounded remainder from /odom,
+        # exactly as the 'near' path does.
         self.finish_standoff(goal_x, goal_y, yaw)
         self.stop_and_settle()
         # Nav2 may stop up to yaw_goal_tolerance (0.25 rad = 14 deg) off the
@@ -989,8 +1104,9 @@ class SearchAndGraspNode(VisualGraspNode):
         # puts the cube out of frame. The fixed look pose then fails all 10 s
         # of the colour search (observed at y=+0.6 m). Re-aim at the cube
         # using the ground-truth search-time point and the base's actual
-        # pose, exactly as the 'near' path does.
-        if not self.aim_at_estimated_cube(cube_xy):
+        # pose, exactly as the 'near' path does. If the cube is still beyond
+        # the arm's reach, align_camera_over_cube() creeps forward first.
+        if not self.align_camera_over_cube(cube_xy):
             return False
         return True
 
