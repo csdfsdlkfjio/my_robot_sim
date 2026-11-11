@@ -86,10 +86,16 @@ NAV_ACTION = 'navigate_to_pose'
 
 # Search pose. The wrist camera looks along the hand +z axis, so rotating the
 # hand by 90 + tilt degrees about y points it forward and ``tilt`` degrees
-# down. At this height the cube's top face stays in view from about 0.5 m to
-# 3 m, which covers everything the base can see from one spot.
+# down. The camera sits right behind the gripper, whose silhouette fills the
+# centre of every frame (the depth image reads 0.06 m there, the room beyond
+# 1 m). With only a 20 degree tilt the cube at the start's 1.45 m distance
+# projected onto the gripper and the sweep only saw it in a ~15 degree window
+# at the frame edge, so a 30 degree step could miss it for a whole turn.
+# Pitching further down puts the table at 1-3 m above the gripper: the cube
+# then projects clear of it at step one. Below ~0.8 m the cube drops below
+# the gripper instead, which the visual grasp's own look pose covers.
 SEARCH_HAND_POSITION = (0.40, 0.0, 0.48)
-SEARCH_CAMERA_TILT = math.radians(20.0)
+SEARCH_CAMERA_TILT = math.radians(34.0)
 # 12 steps of 30 degrees cover a full turn. The first step looks from the
 # current heading, so a cube straight ahead is found without turning.
 SEARCH_STEP_ANGLE = math.pi / 6.0

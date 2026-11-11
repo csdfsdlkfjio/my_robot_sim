@@ -94,8 +94,9 @@ def test_search_camera_points_forward_and_down():
     The camera looks along the hand +z axis.
 
     At this pose it must look ahead of the base (not at the floor beneath
-    it), otherwise the 360 degree search only scans a 0.3 m spot. The tilt
-    keeps the cube's top face in view at 0.5-3 m.
+    it), otherwise the 360 degree search only scans a 0.3 m spot. It must
+    also look far enough down that the room at 1-3 m projects above the
+    robot's own gripper, which fills the middle of every frame.
     """
     rotation = quaternion_matrix(search_camera_quaternion())
     direction = rotation @ np.array([0.0, 0.0, 1.0])
@@ -103,9 +104,11 @@ def test_search_camera_points_forward_and_down():
     assert direction[0] == pytest.approx(math.cos(tilt), abs=1e-9)
     assert direction[1] == pytest.approx(0.0, abs=1e-9)
     assert direction[2] == pytest.approx(-math.sin(tilt), abs=1e-9)
-    # Mostly forward, slightly down.
-    assert direction[0] > 0.9
-    assert -0.5 < direction[2] < 0.0
+    # Mostly forward, clearly down: the gripper blocks the centre of the
+    # frame, so the table at 1-3 m must project above it.
+    assert direction[0] > 0.75
+    assert tilt >= math.radians(30.0)
+    assert -0.7 < direction[2] < -0.45
 
 
 def test_a_full_turn_is_covered_in_steps():
