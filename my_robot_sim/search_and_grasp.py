@@ -170,6 +170,13 @@ NUDGE_FORWARD_DISTANCE = 0.10  # m per attempt
 NUDGE_FORWARD_SPEED = 0.05  # m/s, slower than FINISH_SPEED beside the table
 NUDGE_FORWARD_TIMEOUT = 8.0  # s per attempt
 NUDGE_FORWARD_ATTEMPTS = 2  # at most 20 cm of creeping
+# Creeping only helps when the base is already close: two 10 cm steps can
+# cover a cube just past the arm's reach, nothing more. Live at y=+0.6 m
+# Nav2 never left the start, the cube was still 1.42 m out in panda_link0,
+# yet the old code drove its two 10 cm steps anyway and then failed. A cube
+# farther than this means navigation did not deliver the base; report it and
+# stop instead of pretending a creep can fix it.
+NUDGE_FORWARD_MAX_DISTANCE = 1.0  # m in panda_link0
 # A stop that is merely skewed leaves a large |y| in panda_link0, which the
 # straight creep would refuse even though one bounded turn would make it
 # work. Face the cube first when the heading error is this large. A cube
@@ -372,18 +379,23 @@ def fallback_look_position(cube_in_arm, look_z):
 
 def forward_nudge_distance(cube_in_arm, reach_max=GRASP_REACH_MAX,
                            lateral_max=GRASP_LATERAL_MAX,
-                           distance=NUDGE_FORWARD_DISTANCE):
+                           distance=NUDGE_FORWARD_DISTANCE,
+                           max_distance=NUDGE_FORWARD_MAX_DISTANCE):
     """
     Forward drive that brings a too-distant cube back into reach, or None.
 
     Only a cube straight ahead can be fixed by driving towards it. One that
     is already in reach, too close, or too far to the side needs no nudge
     (or a different correction), so the caller must abort instead of blindly
-    driving into the table.
+    driving into the table. A cube farther than ``max_distance`` means
+    navigation did not deliver the base; a bounded creep cannot close that
+    gap, so it is refused as well.
     """
     x = float(cube_in_arm[0])
     y = float(cube_in_arm[1])
     if x <= reach_max:
+        return None
+    if x > float(max_distance):
         return None
     if abs(y) > lateral_max:
         return None
@@ -739,6 +751,21 @@ class SearchAndGraspNode(VisualGraspNode):
         """Track the remaining distance and the best distance so far."""
         now = time.monotonic()
         distance = float(feedback.feedback.distance_remaining)
+        if not math.isfinite(distance) or distance < 0.0:
+            # Nav2 reports a non-distance while it has no path (planner
+            # failure followed by recovery behaviours). Treating a negative
+            # sentinel as "<= 0.20 m from the goal" started the near-goal
+            # clock at the start line: live at y=+0.6 m the base never moved,
+            # /odom still showed 0.99 m to the goal, yet 20 s later the goal
+            # was cancelled as if it had arrived and the state machine tried
+            # to grasp from 1.4 m away. Ignore anything that is not a real
+            # distance and let the hard timeout / real feedback decide.
+            if not getattr(self, 'nav_invalid_feedback_logged', False):
+                self.nav_invalid_feedback_logged = True
+                self.get_logger().warning(
+                    'Nav2 反馈的剩余距离不可用（%s），忽略；等它给出有效'
+                    '距离后再判断是否到点。' % distance)
+            return
         self.nav_distance_remaining = distance
         if (self.nav_best_distance is None
                 or distance < self.nav_best_distance - NAV_STALL_PROGRESS):
@@ -788,6 +815,7 @@ class SearchAndGraspNode(VisualGraspNode):
         self.nav_distance_remaining = None
         self.nav_best_distance = None
         self.nav_best_since = None
+        self.nav_invalid_feedback_logged = False
         result_future = handle.get_result_async()
         deadline = time.monotonic() + float(timeout)
         while rclpy.ok() and not result_future.done():
@@ -801,6 +829,24 @@ class SearchAndGraspNode(VisualGraspNode):
             if (self.nav_near_since is not None
                     and now - self.nav_near_since
                     >= NAV_NEAR_GOAL_TIMEOUT):
+                # The feedback says "near", but it is a map-frame estimate.
+                # A goal that never actually moved the base can still look
+                # near when the planner produced no path (live at y=+0.6 m:
+                # 0.99 m on /odom after the whole 20 s window). Only hand
+                # over to the fallback grasp when ground truth agrees.
+                measured = self.odom_distance_to_goal(x, y)
+                if measured is None or measured > FINISH_DISTANCE_LIMIT:
+                    self.get_logger().error(
+                        '剩余距离在 %.2f m 内已停留 %.0f s，但 /odom 实测'
+                        '离目标还有 %s：底盘并没有走到目标附近（可能是'
+                        'Nav2 没有路径时的无效反馈，或 AMCL 漂移），'
+                        '取消目标并停车，不在当前位置抓取。'
+                        % (NAV_NEAR_GOAL_DISTANCE, NAV_NEAR_GOAL_TIMEOUT,
+                           '未知' if measured is None
+                           else '%.2f m' % measured))
+                    handle.cancel_goal_async()
+                    self.stop_and_settle()
+                    return 'failed'
                 self.get_logger().warning(
                     '底盘已在目标 %.2f m 内停留 %.0f s 仍未 SUCCEEDED，'
                     '取消导航，改用视觉抓取当前位置 ...'
@@ -860,6 +906,21 @@ class SearchAndGraspNode(VisualGraspNode):
             (rotation.x, rotation.y, rotation.z, rotation.w))
         return point[0], point[1], wrap_angle(float(yaw) + offset_yaw)
 
+    def odom_distance_to_goal(self, goal_x, goal_y):
+        """
+        Distance from the base to a map-frame goal, measured on /odom.
+
+        Nav2's feedback is expressed in the map frame and depends on AMCL,
+        while /odom is ground truth in this simulation. Returns None when
+        either /odom or the map -> odom transform is unavailable.
+        """
+        if self.odom is None:
+            return None
+        goal = self.map_pose_in_odom(goal_x, goal_y, 0.0)
+        if goal is None:
+            return None
+        return odom_distance(odom_xy(self.odom), (goal[0], goal[1]))
+
     def finish_standoff(self, goal_x, goal_y, yaw):
         """
         Drive the last stretch to the standoff when Nav2 stopped short.
@@ -881,9 +942,10 @@ class SearchAndGraspNode(VisualGraspNode):
         start = odom_xy(self.odom)
         distance = math.hypot(goal[0] - start[0], goal[1] - start[1])
         if distance > FINISH_DISTANCE_LIMIT:
-            self.get_logger().warning(
-                '离导航目标还有 %.2f m，超过 %.2f m 的直接补完上限，'
-                '就在当前位置抓取'
+            self.get_logger().error(
+                '离导航目标还有 %.2f m，超过 %.2f m 的直接补完上限：'
+                'Nav2 没有把底盘送到目标附近，不再向前补、也不在当前'
+                '位置抓取，停车退出。'
                 % (distance, FINISH_DISTANCE_LIMIT))
             return False
         if distance > FINISH_TOLERANCE:
@@ -1059,10 +1121,13 @@ class SearchAndGraspNode(VisualGraspNode):
         0.75 m out, the old 0.70 m limit refused it and the run aborted with
         the cube still graspable. Drive forward 10 cm at a time (at most two
         attempts) and re-aim; the normal visual grasp then re-detects from
-        the new pose. If the base stopped skewed rather than short, face the
-        cube first: a bounded turn makes the straight creep work where the
-        arm-frame |y| would otherwise refuse it. A cube behind the base is
-        reported instead of spun towards.
+        the new pose. Creeping is only tried when the cube is within
+        NUDGE_FORWARD_MAX_DISTANCE: a cube farther out means navigation did
+        not deliver the base, and two 10 cm steps cannot fix that. If the
+        base stopped skewed rather than short, face the cube first: a
+        bounded turn makes the straight creep work where the arm-frame |y|
+        would otherwise refuse it. A cube behind the base is reported
+        instead of spun towards.
         """
         if self.aim_at_estimated_cube(cube_xy, log_error=False):
             return True
@@ -1070,6 +1135,18 @@ class SearchAndGraspNode(VisualGraspNode):
             cube, source = self.cube_in_arm_position(cube_xy)
             if cube is None:
                 self.aim_at_estimated_cube(cube_xy)
+                return False
+            if cube[0] > NUDGE_FORWARD_MAX_DISTANCE:
+                # Ten-centimetre steps only make sense just past the arm's
+                # reach. If the cube is still this far out, navigation never
+                # delivered the base and creeping would only move it away
+                # from the standoff it was asked to reach.
+                self.get_logger().error(
+                    '方块在 %s 下为 (%.2f, %.2f)（来源：%s），还有 %.2f m，'
+                    '超过前挪能补回的上限 %.2f m：Nav2 没有把底盘送到位，'
+                    '向前挪 10 cm 没有意义，停止并报错，不再继续抓取。'
+                    % (ARM_BASE_FRAME, cube[0], cube[1], source, cube[0],
+                       NUDGE_FORWARD_MAX_DISTANCE))
                 return False
             if self.cube_world is not None:
                 self.face_the_cube()
@@ -1189,7 +1266,15 @@ class SearchAndGraspNode(VisualGraspNode):
             # Drive the remaining, bounded stretch so the arm gets the
             # standoff geometry it was tuned for, then re-aim the camera
             # using the cube estimate and let the proven visual grasp run.
-            self.finish_standoff(goal_x, goal_y, yaw)
+            # If even /odom says the goal is far away, the 'near' report was
+            # not real: stop and report instead of driving the last stretch
+            # and then creeping towards a cube that is still metres out.
+            if not self.finish_standoff(goal_x, goal_y, yaw):
+                self.get_logger().error(
+                    '导航没有把底盘送到目标附近：停止并退出，不从当前'
+                    '位置补完或向前挪。')
+                self.stop_and_settle()
+                return False
             if not self.align_camera_over_cube(cube_xy):
                 self.get_logger().error(
                     '无法停到可抓范围内：停止并退出，不再原地调整。')
@@ -1203,8 +1288,15 @@ class SearchAndGraspNode(VisualGraspNode):
         # 20 s, finishing 9 cm short and 0.81 m from the cube -- outside the
         # arm's reach then (0.70 m), so the grasp was refused after a
         # "successful" navigation. Drive the bounded remainder from /odom,
-        # exactly as the 'near' path does.
-        self.finish_standoff(goal_x, goal_y, yaw)
+        # exactly as the 'near' path does. Refuse to continue when /odom
+        # contradicts the success report outright (localisation drift, or a
+        # goal that was near in map coordinates but not in the real world).
+        if not self.finish_standoff(goal_x, goal_y, yaw):
+            self.stop_and_settle()
+            self.get_logger().error(
+                'Nav2 报告成功，但位置离目标仍然太远：停止并退出，'
+                '不在当前位置抓取。')
+            return False
         self.stop_and_settle()
         # Nav2 may stop up to yaw_goal_tolerance (0.25 rad = 14 deg) off the
         # bearing to the cube. That is harmless for the arm, which re-aligns

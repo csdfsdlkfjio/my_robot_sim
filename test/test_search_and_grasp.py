@@ -32,6 +32,7 @@ from my_robot_sim.search_and_grasp import (
     NUDGE_ALIGN_TOLERANCE,
     NUDGE_FORWARD_ATTEMPTS,
     NUDGE_FORWARD_DISTANCE,
+    NUDGE_FORWARD_MAX_DISTANCE,
     NUDGE_FORWARD_SPEED,
     RETREAT_DISTANCE,
     SEARCH_CAMERA_TILT,
@@ -450,7 +451,7 @@ def test_fallback_look_position_aims_above_a_reachable_cube():
 
 
 def test_forward_nudge_only_fixes_a_cube_straight_ahead():
-    """Driving forward cannot help a sideways or too-close cube."""
+    """Driving forward cannot help a sideways, too-close or distant cube."""
     assert forward_nudge_distance((0.85, 0.0)) == pytest.approx(
         NUDGE_FORWARD_DISTANCE)
     assert forward_nudge_distance((0.85, 0.20)) == pytest.approx(
@@ -461,6 +462,13 @@ def test_forward_nudge_only_fixes_a_cube_straight_ahead():
     assert forward_nudge_distance((0.85, 0.35)) is None
     # A cube behind/under the base needs a retreat, not a nudge.
     assert forward_nudge_distance((0.20, 0.0)) is None
+    # Live at y=+0.6 m the cube was 1.42 m out after navigation never moved
+    # the base; 10 cm steps cannot close that, so refuse them.
+    assert forward_nudge_distance((1.42, 0.0)) is None
+    assert forward_nudge_distance((1.05, 0.0)) is None
+    # Just past the arm's reach is exactly what a creep is for.
+    assert forward_nudge_distance((0.99, 0.0)) == pytest.approx(
+        NUDGE_FORWARD_DISTANCE)
 
 
 def test_fallback_look_position_rejects_an_unreachable_cube():
@@ -596,6 +604,9 @@ def test_navigation_creeps_forward_when_the_cube_is_still_out_of_reach():
     assert NUDGE_FORWARD_DISTANCE == pytest.approx(0.10)
     assert 0.0 < NUDGE_FORWARD_SPEED <= FINISH_SPEED
     assert NUDGE_FORWARD_ATTEMPTS >= 1
+    # Two 10 cm steps can only rescue a cube just past the reach limit.
+    assert NUDGE_FORWARD_MAX_DISTANCE == pytest.approx(1.0)
+    assert NUDGE_FORWARD_MAX_DISTANCE >= GRASP_REACH_MAX
     with open(MODULE, encoding='utf-8') as handle:
         source = handle.read()
     align = source[
@@ -620,6 +631,54 @@ def test_navigation_creeps_forward_when_the_cube_is_still_out_of_reach():
         source.index('    def retreat')]
     assert navigate.count('align_camera_over_cube') >= 2, (
         'both the near and the succeeded paths must nudge before aborting')
+
+
+def test_navigation_stops_when_nav2_did_not_deliver_the_base():
+    """
+    A 'near' or 'succeeded' report far from the goal must stop the run.
+
+    Live at y=+0.6 m the base stayed at the start, yet the state machine
+    treated the goal as near, ignored finish_standoff()'s refusal and crept
+    twice towards a cube 1.42 m away. Both navigation branches must honour
+    the /odom distance check instead of continuing to the fallback grasp.
+    """
+    with open(MODULE, encoding='utf-8') as handle:
+        source = handle.read()
+    navigate = source[
+        source.index('    def navigate_to_cube'):
+        source.index('    def retreat')]
+    near = navigate[navigate.index("status == 'near'"):]
+    assert 'if not self.finish_standoff(goal_x, goal_y, yaw):' in near
+    assert near.index('if not self.finish_standoff') < near.index(
+        'align_camera_over_cube')
+    after_near = navigate[navigate.index("status == 'near'"):]
+    branch_end = after_near.index('return True') + len('return True')
+    success = after_near[branch_end:]
+    assert 'if not self.finish_standoff(goal_x, goal_y, yaw):' in success
+    assert success.index('if not self.finish_standoff') < success.index(
+        'align_camera_over_cube')
+    # The old message promised a grasp at the current position that the
+    # code did not perform (and should not).
+    assert '不在当前位置抓取' in navigate
+    assert '就在当前位置抓取' not in source
+
+
+def test_alignment_refuses_to_creep_at_a_cube_metres_away():
+    """A cube beyond the creep band needs navigation, not 10 cm steps."""
+    with open(MODULE, encoding='utf-8') as handle:
+        source = handle.read()
+    align = source[
+        source.index('    def align_camera_over_cube'):
+        source.index('    def navigate_to_cube')]
+    assert 'NUDGE_FORWARD_MAX_DISTANCE' in align
+    # Check before turning: a far cube needs navigation, not a face-the-cube
+    # rotation followed by a pointless creep.
+    assert align.index('NUDGE_FORWARD_MAX_DISTANCE') < align.index(
+        'self.face_the_cube()')
+    assert '向前挪 10 cm 没有意义' in align
+    assert 'NUDGE_FORWARD_MAX_DISTANCE' in source[
+        source.index('def forward_nudge_distance'):
+        source.index('def map_cell')]
 
 
 def test_nav_feedback_tracks_the_near_goal_window():
@@ -772,11 +831,13 @@ def make_nav_node(handle):
     node.nav_client = FakeNavClient(handle)
     node.get_logger = lambda: FakeLogger()
     node.stop_and_settle = lambda: None
+    node.odom = None
     node.last_nav_feedback = 0.0
     node.nav_distance_remaining = None
     node.nav_near_since = None
     node.nav_best_distance = None
     node.nav_best_since = None
+    node.nav_invalid_feedback_logged = False
     return node
 
 
@@ -809,6 +870,8 @@ def test_send_nav_goal_returns_near_after_the_endgame_timeout(monkeypatch):
     clock = [1000.0]
     handle = FakeNavHandle(FakeFuture())
     node = make_nav_node(handle)
+    # /odom agrees that the base really is a few centimetres away.
+    node.odom_distance_to_goal = lambda x, y: 0.10
     install_fake_spin(monkeypatch, node, clock, [0.10])
 
     outcome = node.send_nav_goal(1.0, 0.0, 0.0, timeout=100.0)
@@ -817,6 +880,55 @@ def test_send_nav_goal_returns_near_after_the_endgame_timeout(monkeypatch):
     assert handle.canceled
     # One tick to deliver the first feedback, then the 20 s window.
     assert clock[0] - 1000.0 == pytest.approx(NAV_NEAR_GOAL_TIMEOUT + 1.0)
+
+
+def test_send_nav_goal_rejects_a_near_report_that_odom_contradicts(monkeypatch):
+    """
+    A "near" report with the base still a metre away is not an arrival.
+
+    Live at y=+0.6 m the base never moved: /odom showed 0.99 m to the goal
+    after the 20 s near-goal window, yet the old code treated the goal as
+    near, drove the bounded last stretch (refused, too far) and then crept
+    twice towards a cube 1.42 m from panda_link0. Only /odom may confirm
+    the handover to the fallback grasp.
+    """
+    clock = [1000.0]
+    handle = FakeNavHandle(FakeFuture())
+    node = make_nav_node(handle)
+    node.odom_distance_to_goal = lambda x, y: 0.99
+    install_fake_spin(monkeypatch, node, clock, [0.10])
+
+    outcome = node.send_nav_goal(0.82, 0.52, 0.0, timeout=100.0)
+
+    assert outcome == 'failed'
+    assert handle.canceled
+    assert clock[0] - 1000.0 == pytest.approx(NAV_NEAR_GOAL_TIMEOUT + 1.0)
+
+
+def test_nav_feedback_ignores_a_distance_that_is_not_a_distance(monkeypatch):
+    """Nav2 sends negative/NaN feedback while it has no path."""
+    clock = [100.0]
+    node = object.__new__(SearchAndGraspNode)
+    node.get_logger = lambda: FakeLogger()
+    node.last_nav_feedback = 0.0
+    node.nav_distance_remaining = None
+    node.nav_near_since = None
+    node.nav_best_distance = None
+    node.nav_best_since = None
+    monkeypatch.setattr(
+        search_module.time, 'monotonic', lambda: clock[0])
+
+    node._on_nav_feedback(types.SimpleNamespace(
+        feedback=types.SimpleNamespace(distance_remaining=-1.0)))
+    node._on_nav_feedback(types.SimpleNamespace(
+        feedback=types.SimpleNamespace(distance_remaining=float('nan'))))
+
+    assert node.nav_near_since is None, (
+        'an unknown distance must not start the 20 s near-goal clock')
+    assert node.nav_distance_remaining is None
+    assert node.nav_best_distance is None
+    assert node.nav_best_since is None
+    assert node.nav_invalid_feedback_logged
 
 
 def test_send_nav_goal_keeps_waiting_far_from_the_goal(monkeypatch):
