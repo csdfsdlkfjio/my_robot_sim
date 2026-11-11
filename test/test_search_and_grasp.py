@@ -28,6 +28,8 @@ from my_robot_sim.search_and_grasp import (
     NAV_NEAR_GOAL_TIMEOUT,
     RETREAT_DISTANCE,
     SEARCH_CAMERA_TILT,
+    SEARCH_DETECTION_TIMEOUT,
+    SEARCH_FRESH_FRAMES,
     SEARCH_STEP_ANGLE,
     SEARCH_STEPS,
     STANDOFF_DISTANCE,
@@ -110,6 +112,41 @@ def test_a_full_turn_is_covered_in_steps():
     """Twelve 30 degree steps are a full circle."""
     assert SEARCH_STEP_ANGLE * SEARCH_STEPS == pytest.approx(2.0 * math.pi)
     assert SEARCH_STEPS == 12
+
+
+def test_each_step_looks_at_a_frame_taken_after_the_turn():
+    """
+    A full sweep failed live because every look inspected a stale frame.
+
+    The camera publishes at only 1.5-3.7 Hz, so color_image often still held
+    the image from before the 30 degree turn (or from mid arm motion), and a
+    cube that was visible at the new heading was never examined. The stamp
+    must be taken before the turn and the detection must reject older frames.
+    """
+    with open(MODULE, encoding='utf-8') as handle:
+        source = handle.read()
+    assert 'look_from = self.image_stamp' in source
+    assert 'self.turn_by(-SEARCH_STEP_ANGLE)' in source
+    assert source.index('look_from = self.image_stamp') < source.index(
+        'self.turn_by(-SEARCH_STEP_ANGLE)')
+    call = source[source.index('wait_for_fresh_detection('):]
+    assert 'look_from' in call[:120]
+
+
+def test_search_checks_the_camera_before_moving_the_arm():
+    """A stopped camera must fail fast with a hint, not sweep blindly."""
+    with open(MODULE, encoding='utf-8') as handle:
+        source = handle.read()
+    assert 'wait_for_color_image' in source
+    assert 'arm_camera_controller' in source
+    assert source.index('wait_for_color_image') < source.index(
+        'send_move_goal(')
+
+
+def test_the_search_look_spans_at_least_two_camera_frames():
+    """The per-step window must cover two slow frames plus the settle."""
+    assert SEARCH_DETECTION_TIMEOUT >= 2.0
+    assert SEARCH_FRESH_FRAMES >= 2
 
 
 def test_standoff_goal_stops_short_of_the_cube_and_faces_it():
@@ -314,7 +351,7 @@ def test_search_uses_the_camera_not_the_lidar():
         source = handle.read()
     assert 'LaserScan' not in source
     assert "'/scan'" not in source
-    assert 'detect_once' in source or 'wait_for_detection' in source
+    assert 'wait_for_fresh_detection' in source
 
 
 def test_map_cell_converts_world_points_to_grid_indices():

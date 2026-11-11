@@ -72,8 +72,11 @@ from my_robot_sim.mobile_manipulation_node import (
     point_in_world,
 )
 from my_robot_sim.visual_grasp import (
+    CAMERA_TIMEOUT,
     VisualGraspNode,
     source_name,
+    stamp_is_newer,
+    stamp_seconds,
     transform_point,
 )
 
@@ -93,8 +96,15 @@ SEARCH_STEP_ANGLE = math.pi / 6.0
 SEARCH_STEPS = 12
 SEARCH_TURN_SPEED = 0.5  # rad/s
 SEARCH_STEP_TIMEOUT = 10.0  # s per 30 degree step
-SEARCH_SETTLE = 0.6  # s after each step, for a fresh camera frame
-SEARCH_DETECTION_TIMEOUT = 1.0  # s per step
+SEARCH_SETTLE = 0.6  # s after each step, for the base to stop
+# The wrist camera runs at 1.5-3.7 Hz under WSL2 and the Gazebo image
+# pipeline lags the joint motion by up to ~1 s. A 1 s look therefore often
+# only had the frame from before the turn (or from mid arm motion) in
+# color_image, which is why a full 360 degree sweep could miss a visible
+# cube. wait_for_fresh_detection insists on a newer frame and keeps checking
+# until this timeout, which covers two slow frames plus the settle.
+SEARCH_DETECTION_TIMEOUT = 3.0  # s per step
+SEARCH_FRESH_FRAMES = 2  # frames newer than the turn before moving on
 SEARCH_SETTLE_AFTER_LOOK = 0.3  # s, lets the arm stop before the first look
 
 # Nav2 goal distance from the cube centre, squeezed between the arm and the
@@ -566,7 +576,18 @@ class SearchAndGraspNode(VisualGraspNode):
         view costs no rotation; afterwards the base steps 30 degrees at a
         time. A detection is only trusted when the wrist camera's back
         projection yields a map point, otherwise the search continues.
+
+        Each look must be backed by an image taken after the arm or base
+        stopped moving: the camera publishes at only 1.5-3.7 Hz, so the
+        latest stored frame is otherwise often from the previous step (see
+        the SEARCH_DETECTION_TIMEOUT comment).
         """
+        if not self.wait_for_color_image():
+            self.get_logger().error(
+                '相机 %s 在 %.0f s 内没有图像：检查 Gazebo 日志里 '
+                'arm_camera_controller 是否加载成功。'
+                % (self.image_topic, CAMERA_TIMEOUT))
+            return None
         orientation = self.orientation_in_arm_frame(
             search_camera_quaternion())
         self.get_logger().info(
@@ -580,6 +601,9 @@ class SearchAndGraspNode(VisualGraspNode):
         self._spin_for(SEARCH_SETTLE_AFTER_LOOK)
 
         for step in range(self.search_steps):
+            # Anything older than this stamp shows a previous heading (or
+            # the arm still moving), so it must not count as a look.
+            look_from = self.image_stamp
             if step > 0:
                 self.get_logger().info(
                     '搜索：原地旋转 %.0f°（第 %d/%d 步）...'
@@ -588,8 +612,18 @@ class SearchAndGraspNode(VisualGraspNode):
                 self.turn_by(-SEARCH_STEP_ANGLE)
             self._spin_for(SEARCH_SETTLE)
 
-            detection = self.wait_for_detection(SEARCH_DETECTION_TIMEOUT)
+            detection = self.wait_for_fresh_detection(
+                look_from, SEARCH_DETECTION_TIMEOUT,
+                fresh_frames=SEARCH_FRESH_FRAMES)
             if detection is None:
+                if not stamp_is_newer(self.image_stamp, look_from):
+                    latest = stamp_seconds(self.image_stamp)
+                    self.get_logger().warning(
+                        '搜索：第 %d 步没等到新图像（%s 仍停在 %s），'
+                        '继续下一步；如果每步都这样，相机话题可能已经停发。'
+                        % (step + 1, self.image_topic,
+                           '无图像' if latest is None
+                           else '%.1f s' % latest))
                 continue
             self.publish_debug_image(detection)
             self.get_logger().info(

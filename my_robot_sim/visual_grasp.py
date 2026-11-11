@@ -136,6 +136,22 @@ def source_name(source):
     return SOURCE_NAMES.get(source, str(source))
 
 
+def stamp_seconds(stamp):
+    """Seconds as a float from a builtin_interfaces/Time (or None)."""
+    if stamp is None:
+        return None
+    return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+
+def stamp_is_newer(stamp, reference):
+    """True when ``stamp`` was taken after ``reference`` (None = any)."""
+    if stamp is None:
+        return False
+    if reference is None:
+        return True
+    return stamp_seconds(stamp) > stamp_seconds(reference)
+
+
 def bgr_image(message):
     """Return the sensor_msgs/Image frame as a BGR numpy array."""
     if message.encoding not in ('rgb8', 'bgr8'):
@@ -436,6 +452,11 @@ class VisualGraspNode(MobileManipulationNode):
 
         self.color_image = None
         self.image_frame = None
+        # Header stamp of the stored colour image. The search turns the base
+        # between looks, so a detection is only meaningful for an image taken
+        # after that turn; the stamp is how wait_for_fresh_detection tells
+        # a new frame from the one still sitting in color_image.
+        self.image_stamp = None
         self.camera_info = None
         self.depth = None
         # Cube top-face point in the world frame. The cube does not move
@@ -455,10 +476,13 @@ class VisualGraspNode(MobileManipulationNode):
 
     def _on_color_image(self, message):
         try:
-            self.color_image = bgr_image(message)
-            self.image_frame = message.header.frame_id
+            image = bgr_image(message)
         except ValueError as error:
             self.get_logger().warning('忽略图像：%s' % error)
+            return
+        self.color_image = image
+        self.image_frame = message.header.frame_id
+        self.image_stamp = message.header.stamp
 
     def _on_camera_info(self, message):
         self.camera_info = message
@@ -508,6 +532,38 @@ class VisualGraspNode(MobileManipulationNode):
             detection = self.detect_once()
             if detection is not None:
                 return detection
+            rclpy.spin_once(self, timeout_sec=0.05)
+        return None
+
+    def wait_for_fresh_detection(self, newer_than=None, timeout=None,
+                                 fresh_frames=2):
+        """
+        Check only frames taken after ``newer_than`` for a red blob.
+
+        During the search the base turns between looks, so an image received
+        before the turn shows the old heading. The wrist camera runs at
+        1.5-3.7 Hz under WSL2, so a 1 s look often only had the stale frame
+        in ``color_image``: the search then missed a cube that was in view
+        and trusted one that had already left it. ``fresh_frames`` new images
+        are examined before giving up, unless the timeout expires sooner
+        (a stopped camera must not hang the search).
+        """
+        if timeout is None:
+            timeout = self.detection_timeout
+        deadline = time.monotonic() + timeout
+        seen = set()
+        while rclpy.ok() and time.monotonic() < deadline:
+            stamp = self.image_stamp
+            if stamp_is_newer(stamp, newer_than):
+                key = (stamp.sec, stamp.nanosec)
+                if key not in seen:
+                    seen.add(key)
+                    detection = detect_red_blob(
+                        self.color_image, self.min_blob_area)
+                    if detection is not None:
+                        return detection
+                    if len(seen) >= fresh_frames:
+                        return None
             rclpy.spin_once(self, timeout_sec=0.05)
         return None
 

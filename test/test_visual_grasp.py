@@ -5,6 +5,7 @@ import math
 import cv2
 import numpy as np
 import pytest
+from builtin_interfaces.msg import Time
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
 
@@ -26,6 +27,8 @@ from my_robot_sim.visual_grasp import (
     red_mask,
     scale_pixel,
     source_name,
+    stamp_is_newer,
+    stamp_seconds,
     transform_direction,
     transform_point,
     transform_points,
@@ -380,3 +383,38 @@ def test_lifted_position_raises_only_z():
     """A lift must not move the grasp sideways."""
     lifted = lifted_position((0.5, 0.1, 0.35), 0.10)
     assert lifted == pytest.approx((0.5, 0.1, 0.45))
+
+
+def test_stamp_seconds_reads_the_nanoseconds():
+    """Image stamps are compared as float seconds."""
+    assert stamp_seconds(Time(sec=12, nanosec=500000000)) == pytest.approx(
+        12.5)
+    assert stamp_seconds(None) is None
+
+
+def test_stamp_is_newer_rejects_the_frame_already_seen():
+    """
+    The search must not re-use the image from before the turn.
+
+    The same frame compares as not newer, so wait_for_fresh_detection keeps
+    spinning until Gazebo published one taken after the base stopped.
+    """
+    old = Time(sec=5, nanosec=0)
+    new = Time(sec=5, nanosec=400000000)
+    assert stamp_is_newer(new, old)
+    assert not stamp_is_newer(old, new)
+    assert not stamp_is_newer(old, old)
+    assert stamp_is_newer(old, None)
+    assert not stamp_is_newer(None, old)
+
+
+def test_color_image_remembers_its_header_stamp():
+    """wait_for_fresh_detection can only work when the stamp is stored."""
+    import os
+    path = os.path.join(os.path.dirname(__file__), '..', 'my_robot_sim',
+                        'visual_grasp.py')
+    with open(path, encoding='utf-8') as handle:
+        source = handle.read()
+    assert 'self.image_stamp = message.header.stamp' in source
+    assert 'def wait_for_fresh_detection' in source
+    assert 'stamp_is_newer(stamp, newer_than)' in source
