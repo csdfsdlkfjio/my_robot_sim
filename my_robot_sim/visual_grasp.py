@@ -541,12 +541,12 @@ class VisualGraspNode(MobileManipulationNode):
         Check only frames taken after ``newer_than`` for a red blob.
 
         During the search the base turns between looks, so an image received
-        before the turn shows the old heading. The wrist camera runs at
-        1.5-3.7 Hz under WSL2, so a 1 s look often only had the stale frame
-        in ``color_image``: the search then missed a cube that was in view
-        and trusted one that had already left it. ``fresh_frames`` new images
-        are examined before giving up, unless the timeout expires sooner
-        (a stopped camera must not hang the search).
+        before the turn shows the old heading. The wrist camera publishes at
+        only 0.3-0.6 Hz under WSL2, so a 1 s look often only had the stale
+        frame in ``color_image``: the search then missed a cube that was in
+        view and trusted one that had already left it. ``fresh_frames`` new
+        images are examined before giving up, unless the timeout expires
+        sooner (a stopped camera must not hang the search).
         """
         if timeout is None:
             timeout = self.detection_timeout

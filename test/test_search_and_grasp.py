@@ -147,8 +147,14 @@ def test_search_checks_the_camera_before_moving_the_arm():
 
 
 def test_the_search_look_spans_at_least_two_camera_frames():
-    """The per-step window must cover two slow frames plus the settle."""
-    assert SEARCH_DETECTION_TIMEOUT >= 2.0
+    """
+    The per-step window must cover two slow frames plus the settle.
+
+    ``ros2 topic hz`` measured 0.3-0.6 Hz (up to 4.9 s between images) while
+    the base moved, so a window shorter than one worst-case gap can pass a
+    step without a single frame from the new heading.
+    """
+    assert SEARCH_DETECTION_TIMEOUT >= 5.0
     assert SEARCH_FRESH_FRAMES >= 2
 
 

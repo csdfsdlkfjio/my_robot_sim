@@ -103,13 +103,14 @@ SEARCH_STEPS = 12
 SEARCH_TURN_SPEED = 0.5  # rad/s
 SEARCH_STEP_TIMEOUT = 10.0  # s per 30 degree step
 SEARCH_SETTLE = 0.6  # s after each step, for the base to stop
-# The wrist camera runs at 1.5-3.7 Hz under WSL2 and the Gazebo image
-# pipeline lags the joint motion by up to ~1 s. A 1 s look therefore often
-# only had the frame from before the turn (or from mid arm motion) in
-# color_image, which is why a full 360 degree sweep could miss a visible
-# cube. wait_for_fresh_detection insists on a newer frame and keeps checking
-# until this timeout, which covers two slow frames plus the settle.
-SEARCH_DETECTION_TIMEOUT = 3.0  # s per step
+# The wrist camera is slow under WSL2: `ros2 topic hz /camera/image_raw`
+# measured 0.3-0.6 Hz, with up to 4.9 s between frames while the base moves.
+# A 1 s look therefore often only had the frame from before the turn (or
+# from mid arm motion) in color_image, which is why a full 360 degree sweep
+# could miss a visible cube. wait_for_fresh_detection insists on a newer
+# frame; this window must cover the worst observed gap so that even a slow
+# camera gets a chance to show the new heading.
+SEARCH_DETECTION_TIMEOUT = 5.0  # s per step
 SEARCH_FRESH_FRAMES = 2  # frames newer than the turn before moving on
 SEARCH_SETTLE_AFTER_LOOK = 0.3  # s, lets the arm stop before the first look
 
