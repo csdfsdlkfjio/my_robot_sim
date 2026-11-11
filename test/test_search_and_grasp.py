@@ -26,6 +26,10 @@ from my_robot_sim.search_and_grasp import (
     NAV_GOAL_SAFE_CLEARANCE,
     NAV_NEAR_GOAL_DISTANCE,
     NAV_NEAR_GOAL_TIMEOUT,
+    NAV_STALL_PROGRESS,
+    NAV_STALL_TIMEOUT,
+    NUDGE_ALIGN_MAX,
+    NUDGE_ALIGN_TOLERANCE,
     NUDGE_FORWARD_ATTEMPTS,
     NUDGE_FORWARD_DISTANCE,
     NUDGE_FORWARD_SPEED,
@@ -212,15 +216,16 @@ def test_standoff_goal_bearing_offset_moves_the_goal_but_faces_the_cube():
         assert math.hypot(x - nominal[0], y - nominal[1]) > 0.05
 
 
-def test_standoff_candidates_try_the_nominal_goal_first():
+def test_standoff_candidates_retreat_before_stepping_sideways():
     """
-    Preferred order: nominal, every bearing at the standoff, then retreats.
+    Preferred order: nominal, on-line retreats, then side bearings last.
 
-    A retreat lengthens the cube-to-base distance, and panda_link0 measures
-    about 4 cm more than base_link; at y=+0.6 m the retreat was chosen over
-    an equally free bearing and the base ended 0.74 m from the cube, past the
-    0.70 m reach limit. Reach-preserving bearings must be tried first, and no
-    retreat may go beyond 5 cm.
+    Live at y=+0.6 m the guard rejected the nominal goal (0.86, 0.36) and
+    picked the -15 deg bearing (0.82, 0.52) instead. That goal sits beside
+    and behind the cube: Nav2 spun in place and ended at (0.19, -0.42), far
+    outside the arm's reach. A short retreat along the robot-to-cube line
+    keeps the base facing the cube and shortens nothing the camera needs, so
+    it must be tried before any bearing that moves the goal around the cube.
     """
     cube = (1.45, 0.6)
     robot = (0.48, -0.14)
@@ -228,10 +233,17 @@ def test_standoff_candidates_try_the_nominal_goal_first():
     offset, extra, x, y, yaw = candidates[0]
     assert (offset, extra) == (0.0, 0.0)
     assert (x, y, yaw) == pytest.approx(standoff_goal(cube, robot, 0.6))
-    # All bearings at the nominal radius come before the first retreat.
-    first_retreat = next(i for i, c in enumerate(candidates) if c[1] > 0.0)
-    assert first_retreat == len(NAV_GOAL_BEARING_OFFSETS)
-    assert candidates[1][1] == 0.0 and candidates[1][0] != 0.0
+    # Every on-line retreat comes before the first side bearing.
+    on_line = len(NAV_GOAL_RETREAT_STEPS) + 1
+    assert all(candidate[0] == 0.0 for candidate in candidates[:on_line])
+    assert [candidate[1] for candidate in candidates[1:on_line]] == list(
+        NAV_GOAL_RETREAT_STEPS)
+    assert all(candidate[0] != 0.0 for candidate in candidates[on_line:])
+    assert candidates[on_line][0] == NAV_GOAL_BEARING_OFFSETS[1]
+    # Retreating on the same ray keeps the heading at the cube unchanged.
+    nominal_yaw = standoff_goal(cube, robot, 0.6)[2]
+    for candidate in candidates[1:on_line]:
+        assert candidate[4] == pytest.approx(nominal_yaw)
     assert max(NAV_GOAL_RETREAT_STEPS) <= 0.05
     for offset, extra, x, y, yaw in candidates:
         # Every candidate keeps the cube within the arm's reach.
@@ -620,6 +632,77 @@ def test_nav_feedback_tracks_the_near_goal_window():
     assert 'distance_remaining' in feedback
     assert 'NAV_NEAR_GOAL_DISTANCE' in feedback
     assert 'nav_near_since' in feedback
+    assert 'NAV_STALL_PROGRESS' in feedback
+    assert 'nav_best_distance' in feedback
+
+
+def test_navigation_only_uses_a_side_bearing_when_no_on_line_goal_is_free():
+    """
+    A rejected on-line goal must retreat before swinging around the cube.
+
+    Live at y=+0.6 m the guard rejected (0.86, 0.36) and jumped straight to
+    the -15 deg bearing, which put the goal beside/behind the cube; Nav2 then
+    spun and finished at (0.19, -0.42). On-line goals at the strict 0.30 m
+    margin, then at the bare 0.24 m margin, must be exhausted before any
+    bearing is considered.
+    """
+    with open(MODULE, encoding='utf-8') as handle:
+        source = handle.read()
+    navigate = source[
+        source.index('    def navigate_to_cube'):
+        source.index('    def retreat')]
+    order = [
+        'first_free(NAV_GOAL_SAFE_CLEARANCE)',
+        'first_free(NAV_GOAL_CLEARANCE)',
+        'first_free(NAV_GOAL_SAFE_CLEARANCE, bearings=True)',
+        'first_free(NAV_GOAL_CLEARANCE, bearings=True)',
+    ]
+    positions = [navigate.index(call) for call in order]
+    assert positions == sorted(positions), (
+        'side bearings must be the last resort')
+    # The helper really filters the two groups; otherwise "bearings=True"
+    # would only change the order of an unfiltered list.
+    assert 'def first_free(clearance, bearings=False)' in navigate
+    assert 'if on_line != bearings:' in navigate
+
+
+def test_camera_alignment_faces_the_cube_before_creeping_straight():
+    """A skewed stop must be turned straight, not declared out of reach."""
+    assert 0.0 < NUDGE_ALIGN_TOLERANCE < NUDGE_ALIGN_MAX <= math.pi / 2.0
+    with open(MODULE, encoding='utf-8') as handle:
+        source = handle.read()
+    align = source[
+        source.index('    def align_camera_over_cube'):
+        source.index('    def navigate_to_cube')]
+    assert 'self.face_the_cube()' in align
+    assert align.index('self.face_the_cube()') < align.index(
+        'forward_nudge_distance(cube)')
+    face = source[
+        source.index('    def face_the_cube'):
+        source.index('    def nudge_forward')]
+    # Turning is bounded and measured, and a cube behind the base is refused.
+    assert 'self.turn_by(error' in face
+    assert 'NUDGE_ALIGN_MAX' in face
+    assert 'return False' in face
+
+
+def test_navigation_stops_and_reports_instead_of_adjusting_forever():
+    """When no bounded adjustment works, stop; do not spin in place."""
+    with open(MODULE, encoding='utf-8') as handle:
+        source = handle.read()
+    navigate = source[
+        source.index('    def navigate_to_cube'):
+        source.index('    def retreat')]
+    message = '无法停到可抓范围内：停止并退出，不再原地调整。'
+    assert navigate.count(message) == 2, (
+        'both the near and the succeeded paths must stop and report')
+    cursor = 0
+    for _ in range(2):
+        index = navigate.index(message, cursor)
+        after = navigate[index:]
+        assert after.index('self.stop_and_settle()') < after.index(
+            'return False')
+        cursor = index + len(message)
 
 
 class FakeFuture:
@@ -692,6 +775,8 @@ def make_nav_node(handle):
     node.last_nav_feedback = 0.0
     node.nav_distance_remaining = None
     node.nav_near_since = None
+    node.nav_best_distance = None
+    node.nav_best_since = None
     return node
 
 
@@ -746,6 +831,97 @@ def test_send_nav_goal_keeps_waiting_far_from_the_goal(monkeypatch):
     assert outcome == 'failed'
     assert handle.canceled
     assert clock[0] - 1000.0 == pytest.approx(5.0)
+
+
+def test_send_nav_goal_cancels_a_goal_that_makes_no_progress(monkeypatch):
+    """A goal DWB circles for a minute must fail, not spin for 180 s."""
+    clock = [1000.0]
+    handle = FakeNavHandle(FakeFuture())
+    node = make_nav_node(handle)
+    install_fake_spin(monkeypatch, node, clock, [1.5])
+
+    outcome = node.send_nav_goal(1.0, 0.0, 0.0, timeout=300.0)
+
+    assert outcome == 'failed'
+    assert handle.canceled
+    # One tick for the first feedback, then the 60 s stall window.
+    assert clock[0] - 1000.0 == pytest.approx(NAV_STALL_TIMEOUT + 1.0)
+
+
+def test_nav_feedback_restarts_stall_clock_after_progress(monkeypatch):
+    """A 2 cm wobble is not progress; 20 cm restarts the clock."""
+    clock = [100.0]
+    node = object.__new__(SearchAndGraspNode)
+    node.get_logger = lambda: FakeLogger()
+    node.last_nav_feedback = 0.0
+    node.nav_distance_remaining = None
+    node.nav_near_since = None
+    node.nav_best_distance = None
+    node.nav_best_since = None
+    monkeypatch.setattr(
+        search_module.time, 'monotonic', lambda: clock[0])
+
+    def feedback(distance):
+        node._on_nav_feedback(types.SimpleNamespace(
+            feedback=types.SimpleNamespace(distance_remaining=distance)))
+
+    feedback(1.0)
+    assert node.nav_best_distance == pytest.approx(1.0)
+    assert node.nav_best_since == pytest.approx(100.0)
+    clock[0] = 130.0
+    feedback(0.98)  # 2 cm: inside the noise floor, no reset
+    assert node.nav_best_since == pytest.approx(100.0)
+    clock[0] = 145.0
+    feedback(0.75)  # 25 cm: genuine progress
+    assert node.nav_best_distance == pytest.approx(0.75)
+    assert node.nav_best_since == pytest.approx(145.0)
+    assert NAV_STALL_PROGRESS == pytest.approx(0.05)
+
+
+def test_face_the_cube_turns_a_skewed_stop_towards_the_cube():
+    """A 17 deg heading error is corrected with one bounded turn."""
+    node = object.__new__(SearchAndGraspNode)
+    node.get_logger = lambda: FakeLogger()
+    node.cube_world = (1.0, 0.0, 0.04)
+    node.odom = object()
+    heading = [math.radians(-17.0)]
+
+    def base_pose():
+        qx, qy, qz, qw = yaw_quaternion(heading[0])
+        return types.SimpleNamespace(
+            position=types.SimpleNamespace(x=0.0, y=0.0, z=0.2),
+            orientation=types.SimpleNamespace(
+                x=qx, y=qy, z=qz, w=qw))
+
+    node.base_pose = base_pose
+    turns = []
+
+    def turn_by(error, timeout=None):
+        turns.append((error, timeout))
+        heading[0] += error
+
+    node.turn_by = turn_by
+
+    assert node.face_the_cube()
+    assert len(turns) == 1
+    assert turns[0][0] == pytest.approx(math.radians(17.0))
+    assert turns[0][1] == pytest.approx(FINISH_TURN_TIMEOUT)
+
+
+def test_face_the_cube_refuses_a_cube_behind_the_base():
+    """Turning 180 deg to creep forward is not bounded; report instead."""
+    node = object.__new__(SearchAndGraspNode)
+    node.get_logger = lambda: FakeLogger()
+    node.cube_world = (-1.0, 0.0, 0.04)  # directly behind
+    node.odom = object()
+    node.base_pose = lambda: types.SimpleNamespace(
+        position=types.SimpleNamespace(x=0.0, y=0.0, z=0.2),
+        orientation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0))
+    turns = []
+    node.turn_by = lambda error, timeout=None: turns.append(error)
+
+    assert not node.face_the_cube()
+    assert turns == []
 
 
 def test_send_nav_goal_reports_a_canceled_goal(monkeypatch):
