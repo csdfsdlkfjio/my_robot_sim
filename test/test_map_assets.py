@@ -18,6 +18,7 @@ from my_robot_sim.search_and_grasp import (
     NAV_GOAL_RETREAT_STEPS,
     STANDOFF_DISTANCE,
     clearance_violation,
+    standoff_candidates,
     standoff_goal,
 )
 
@@ -182,9 +183,9 @@ def test_goal_retreat_recovers_from_a_biased_cube_estimate():
     A cube at y=-0.6 m seen obliquely was estimated at (1.539, -0.642).
 
     That 9 cm east bias put the nominal 0.6 m standoff at x=0.99, only
-    0.16 m from the table, so the goal check refused it. Retreating along
-    the same cube->robot line by one of NAV_GOAL_RETREAT_STEPS must yield a
-    goal the check accepts, otherwise search_and_grasp would give up on a
+    0.16 m from the table, so the goal check refused it. The candidate
+    generator must find a goal the check accepts while keeping the cube
+    within the arm's reach, otherwise search_and_grasp would give up on a
     perfectly graspable left/right cube.
     """
     info = load_map_info()
@@ -196,31 +197,50 @@ def test_goal_retreat_recovers_from_a_biased_cube_estimate():
         grid, image.shape[1], image.shape[0],
         info['origin'][0], info['origin'][1], info['resolution'],
         nominal[0], nominal[1], NAV_GOAL_CLEARANCE) is not None
-    candidates = [
-        standoff_goal(cube_xy, robot_xy, STANDOFF_DISTANCE + extra)
-        for extra in NAV_GOAL_RETREAT_STEPS]
-    reasons = [
-        clearance_violation(
+    chosen = None
+    for offset, extra, x, y, yaw in standoff_candidates(
+            cube_xy, robot_xy, STANDOFF_DISTANCE):
+        reason = clearance_violation(
             grid, image.shape[1], image.shape[0],
             info['origin'][0], info['origin'][1], info['resolution'],
-            goal[0], goal[1], NAV_GOAL_CLEARANCE)
-        for goal in candidates]
-    assert reasons[-1] is None, reasons
+            x, y, NAV_GOAL_CLEARANCE)
+        if reason is None:
+            chosen = (offset, extra, x, y)
+            break
+    assert chosen is not None, (
+        'no bearing/retreat candidate cleared the table')
+    # Reach-preserving: panda_link0 measures ~4 cm more than base_link.
+    assert chosen[1] <= max(NAV_GOAL_RETREAT_STEPS)
+    assert math.hypot(chosen[2] - cube_xy[0], chosen[3] - cube_xy[1]) <= (
+        STANDOFF_DISTANCE + max(NAV_GOAL_RETREAT_STEPS) + 1e-9)
 
 
 def test_lateral_goal_beyond_the_table_reach_is_rejected():
-    """A cube near the table's end must not put the goal inside the table."""
+    """
+    A cube near the table's end must not put the goal inside the table.
+
+    The current 0.63 m standoff clears the table even from the origin, so
+    the guard is checked with a short 0.4 m standoff: its goal falls inside
+    the table's clearance band and must be refused.
+    """
     config = load_config(GRASP_CONFIG)
     info = load_map_info()
     image = read_pgm(os.path.join(os.path.dirname(MAP_YAML), info['image']))
     grid = occupancy_grid_from_pgm(image, info)
     goal_x, goal_y, _ = standoff_goal(
-        (config['x'], 0.75), (0.0, 0.0), STANDOFF_DISTANCE)
+        (config['x'], 0.75), (0.0, 0.0), 0.4)
     reason = clearance_violation(
         grid, image.shape[1], image.shape[0],
         info['origin'][0], info['origin'][1], info['resolution'],
         goal_x, goal_y, NAV_GOAL_CLEARANCE)
     assert reason == '附近有墙壁或障碍物'
+    # And the standoff actually used must keep the same cube clear.
+    goal_x, goal_y, _ = standoff_goal(
+        (config['x'], 0.75), (0.0, 0.0), STANDOFF_DISTANCE)
+    assert clearance_violation(
+        grid, image.shape[1], image.shape[0],
+        info['origin'][0], info['origin'][1], info['resolution'],
+        goal_x, goal_y, NAV_GOAL_CLEARANCE) is None
 
 
 def test_demo_world_is_valid_sdf():

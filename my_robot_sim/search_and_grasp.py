@@ -62,6 +62,7 @@ from tf2_ros import TransformException
 from my_robot_sim.mobile_manipulation_node import (
     ARM_BASE_FRAME,
     GRIPPER_OPEN,
+    ODOM_FRAME,
     TF_TIMEOUT,
     make_forward_twist,
     make_gripper_goal,
@@ -96,13 +97,21 @@ SEARCH_SETTLE = 0.6  # s after each step, for a fresh camera frame
 SEARCH_DETECTION_TIMEOUT = 1.0  # s per step
 SEARCH_SETTLE_AFTER_LOOK = 0.3  # s, lets the arm stop before the first look
 
-# Nav2 goal distance from the cube centre. The Panda reaches about 0.85 m
-# from panda_link0, and the visual grasp expects the cube roughly 0.45-0.65 m
-# in front of base_link, so 1 m would be out of reach. 0.6 m is the closest
-# goal that still keeps the 0.22 m footprint clear of the new long table:
-# its front face is 0.30 m behind the cube centre at the table's middle, so a
-# 0.5 m standoff would put the base circle 2 cm inside the table.
-STANDOFF_DISTANCE = 0.6  # m
+# Nav2 goal distance from the cube centre, squeezed between the arm and the
+# table's local costmap:
+#   * reach: the grasp refuses beyond GRASP_REACH_MAX = 0.70 m in panda_link0,
+#     which sits 4 cm behind base_link, so the base may be at most ~0.66 m
+#     from the cube (0.70 m read 0.74 m and was refused live);
+#   * costmap: the table's front face is x=1.15 and the cube x=1.455. The
+#     local costmap marks the whole band x >= 0.875 (cells at 0.90 and beyond
+#     cost 99 = inscribed obstacle) because the robot radius 0.22 plus one
+#     cell. A goal there makes DWB report "No valid trajectories out of 419,
+#     BaseObstacle hits obstacle", the base wedges 0.28 m short and Nav2
+#     aborts. 0.63 m puts the goal at x ~ 0.84, still reachable (x >= 0.795)
+#     and outside the inscribed band.
+# The visual grasp expects the cube 0.45-0.65 m in front of base_link, so
+# 0.63 also stays inside the band it was tuned for.
+STANDOFF_DISTANCE = 0.63  # m
 NAV_START_TIMEOUT = 30.0  # s for the goal to be accepted
 NAV_TIMEOUT = 180.0  # s hard cap for the goal to finish
 NAV_FEEDBACK_PERIOD = 3.0  # s between distance logs
@@ -133,12 +142,59 @@ MAP_TOPIC = '/map'
 # up to a cell diagonal, which made a cube at y=+/-0.6 m unusable even though
 # the base would have kept 25 cm of real clearance.
 NAV_GOAL_CLEARANCE = 0.24  # m; the robot's footprint radius plus a margin
+# Nav2's local costmap inflates the table by the 0.22 m robot radius, and a
+# goal whose cell lands inside that inscribed band is unreachable no matter
+# what DWB does: every trajectory reports "BaseObstacle hits obstacle" and
+# the base wedges (observed 0.28 m short, then ABORTED). The band's edge sits
+# at x ~ 0.875 in this world (cells at 0.90 and east cost 99), so goals need
+# roughly one more cell of slack than the footprint: 0.30 m puts them at
+# x <= 0.85. Candidates are tried at this clearance first and only then at
+# NAV_GOAL_CLEARANCE, so a biased cube estimate can still be approached.
+NAV_GOAL_SAFE_CLEARANCE = 0.30  # m; keeps the goal cell out of the band
 OCCUPIED_THRESHOLD = 65  # percent, equal to my_map.yaml's occupied_thresh
-# Extra standoff distances tried when the nominal goal fails the clearance
-# check. A cube at |y| = 0.6 m seen obliquely can be estimated ~10 cm too
-# far east; 5-10 cm of retreat moves the goal off the table while keeping
-# the true cube within the arm's reach.
-NAV_GOAL_RETREAT_STEPS = (0.05, 0.10)
+# Extra standoff distances tried when no bearing at the nominal standoff
+# clears the table. A cube at |y| = 0.6 m seen obliquely can be estimated
+# ~10 cm too far east; a small retreat moves the goal west of the table
+# while keeping the true cube within the arm's reach.
+# 2 cm is the most the arm allows on top of 0.63: the radius is measured
+# from the cube, while the grasp measures from panda_link0, which sits
+# ARM_MOUNT_OFFSET (4 cm) behind base_link. 0.70 m at most keeps the
+# measured distance under GRASP_REACH_MAX = 0.70 m with a little slack.
+NAV_GOAL_RETREAT_STEPS = (0.02,)
+# Retreating along the cube->base line only helps when that line is roughly
+# perpendicular to the long table. If the base was left at a shallow angle
+# (e.g. beside the table after the previous run), every point on the line
+# inside the arm's reach lies in the table's clearance band -- measured from
+# (0.48, -0.14) the nominal goal (1.00, 0.24) was only 15 cm from the table
+# face, and 5/10 cm of retreat still left it under 24 cm. Try neighbouring
+# bearings around the cube instead: the radius stays at the standoff, so the
+# arm still reaches, while a different approach direction moves the goal off
+# the table.
+NAV_GOAL_BEARING_OFFSETS = (
+    0.0,
+    math.radians(15.0), -math.radians(15.0),
+    math.radians(30.0), -math.radians(30.0),
+    math.radians(45.0), -math.radians(45.0))
+
+# Nav2's controller can give up within NAV_NEAR_GOAL_DISTANCE of the goal
+# (it stalls during the final in-place rotation next to the inflated table).
+# The last stretch is then driven directly: the goal already passed the map
+# clearance check, /odom is Gazebo ground truth, and the motion is bounded.
+# Live at y=+0.6 m the base settled 9 cm short and 0.74 m from the cube,
+# outside the arm's reach, so the fallback grasp could not start.
+FINISH_SPEED = 0.08  # m/s
+FINISH_DISTANCE_LIMIT = 0.25  # m; farther than this is not a last stretch
+FINISH_TOLERANCE = 0.02  # m short of the goal is fine
+FINISH_TIMEOUT = 8.0  # s for the direct drive
+FINISH_YAW_TOLERANCE = math.radians(4.0)
+# 6 s was too short for the last rotation. Commanded 0.5 rad/s the base turns
+# at ~0.39 rad/s on open ground, but next to the table it has been measured
+# at ~0.1 rad/s (the driven wheels slip and the unpowered caster drags), so a
+# 134 deg correction needed ~23 s and every 6 s attempt stopped two thirds
+# of the way with "只转了 ...". turn_by leaves the loop as soon as the target
+# is reached, so a generous deadline only costs time when the base really is
+# stuck.
+FINISH_TURN_TIMEOUT = 25.0  # s per rotation
 
 # AMCL has to publish map -> base_link before a map-frame goal means anything.
 MAP_WAIT_TIMEOUT = 30.0  # s
@@ -195,12 +251,15 @@ def search_camera_quaternion(tilt=SEARCH_CAMERA_TILT):
     return (0.0, math.sin(half), 0.0, math.cos(half))
 
 
-def standoff_goal(cube_xy, robot_xy, standoff=STANDOFF_DISTANCE):
+def standoff_goal(cube_xy, robot_xy, standoff=STANDOFF_DISTANCE,
+                  bearing_offset=0.0):
     """
     Return (x, y, yaw) for the Nav2 goal ``standoff`` metres from the cube.
 
     The goal sits on the line from the cube to the robot, so the base keeps
     the side it already sees the cube from, and it faces the cube.
+    ``bearing_offset`` rotates that line about the cube, keeping the radius
+    and the facing, to move the goal away from the long table.
     """
     dx = float(robot_xy[0]) - float(cube_xy[0])
     dy = float(robot_xy[1]) - float(cube_xy[1])
@@ -208,14 +267,34 @@ def standoff_goal(cube_xy, robot_xy, standoff=STANDOFF_DISTANCE):
     if distance < 1e-6:
         # Degenerate: the robot thinks it is on top of the cube. Approach
         # from -x, which matches the direction it was driving.
-        ux, uy = -1.0, 0.0
+        angle = math.pi
     else:
-        ux, uy = dx / distance, dy / distance
-    goal_x = float(cube_xy[0]) + float(standoff) * ux
-    goal_y = float(cube_xy[1]) + float(standoff) * uy
+        angle = math.atan2(dy, dx)
+    angle += float(bearing_offset)
+    goal_x = float(cube_xy[0]) + float(standoff) * math.cos(angle)
+    goal_y = float(cube_xy[1]) + float(standoff) * math.sin(angle)
     yaw = math.atan2(float(cube_xy[1]) - goal_y,
                      float(cube_xy[0]) - goal_x)
     return goal_x, goal_y, yaw
+
+
+def standoff_candidates(cube_xy, robot_xy, standoff=STANDOFF_DISTANCE):
+    """
+    Yield (bearing_offset, extra, x, y, yaw) goals, preferred order first.
+
+    The nominal goal comes first, then every neighbouring bearing at the
+    nominal standoff, and only then the along-line retreats. Bearing first
+    matters: at y=+0.6 m the same bearing plus a 10 cm retreat was the first
+    free candidate, but 0.70 m from the cube is past the arm's reach; a
+    -15 deg bearing at the unchanged 0.60 m standoff was also free and keeps
+    the cube graspable. The caller keeps the first candidate that passes the
+    map clearance check, so the reach-preserving ones must come first.
+    """
+    for extra in (0.0,) + NAV_GOAL_RETREAT_STEPS:
+        for offset in NAV_GOAL_BEARING_OFFSETS:
+            x, y, yaw = standoff_goal(
+                cube_xy, robot_xy, float(standoff) + extra, offset)
+            yield offset, extra, x, y, yaw
 
 
 def fallback_look_position(cube_in_arm, look_z):
@@ -391,7 +470,7 @@ class SearchAndGraspNode(VisualGraspNode):
             rclpy.spin_once(self, timeout_sec=0.1)
         return self.map_msg is not None
 
-    def goal_is_free(self, x, y):
+    def goal_is_free(self, x, y, clearance=NAV_GOAL_CLEARANCE):
         """Check that (x, y) is free with room for the robot's foot print."""
         if self.map_msg is None:
             return False, '没有收到 %s' % MAP_TOPIC
@@ -399,7 +478,7 @@ class SearchAndGraspNode(VisualGraspNode):
         reason = clearance_violation(
             self.map_msg.data, info.width, info.height,
             info.origin.position.x, info.origin.position.y,
-            info.resolution, x, y, NAV_GOAL_CLEARANCE)
+            info.resolution, x, y, clearance)
         return reason is None, reason or ''
 
     def wait_for_map(self, timeout=MAP_WAIT_TIMEOUT):
@@ -641,6 +720,85 @@ class SearchAndGraspNode(VisualGraspNode):
             self.get_logger().error('导航失败，Action 状态 %d' % status)
         return 'failed'
 
+    def map_pose_in_odom(self, x, y, yaw, timeout=TF_TIMEOUT):
+        """Express a map-frame pose in the odom frame, or return None."""
+        deadline = time.monotonic() + timeout
+        while rclpy.ok() and time.monotonic() < deadline:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    ODOM_FRAME, MAP_FRAME, time_msg())
+                break
+            except TransformException:
+                rclpy.spin_once(self, timeout_sec=0.1)
+        else:
+            return None
+        point = transform_point(transform, (x, y, 0.0))
+        rotation = transform.transform.rotation
+        offset_yaw = quaternion_yaw(
+            (rotation.x, rotation.y, rotation.z, rotation.w))
+        return point[0], point[1], wrap_angle(float(yaw) + offset_yaw)
+
+    def finish_standoff(self, goal_x, goal_y, yaw):
+        """
+        Drive the last stretch to the standoff when Nav2 stopped short.
+
+        Only called after Nav2 reported the base near the goal and cancelled.
+        The goal passed the map clearance check, /odom is ground truth and
+        the remaining distance is bounded, so a slow straight drive is safer
+        than letting the arm-to-cube distance decide the grasp.
+        """
+        if self.odom is None:
+            self.get_logger().error('没有 /odom，无法补完最后一段导航')
+            return False
+        goal = self.map_pose_in_odom(goal_x, goal_y, yaw)
+        if goal is None:
+            self.get_logger().error(
+                '没有 %s -> %s 的 TF，无法补完最后一段导航'
+                % (ODOM_FRAME, MAP_FRAME))
+            return False
+        start = odom_xy(self.odom)
+        distance = math.hypot(goal[0] - start[0], goal[1] - start[1])
+        if distance > FINISH_DISTANCE_LIMIT:
+            self.get_logger().warning(
+                '离导航目标还有 %.2f m，超过 %.2f m 的直接补完上限，'
+                '就在当前位置抓取'
+                % (distance, FINISH_DISTANCE_LIMIT))
+            return False
+        if distance > FINISH_TOLERANCE:
+            # Nav2 may still be coasting on its last velocity command when the
+            # goal reports SUCCEEDED (the base has no brake), and any leftover
+            # command fights the in-place turn. Stop first so the rotation is
+            # measured against a still base.
+            self.stop_and_settle()
+            start = odom_xy(self.odom)
+            distance = math.hypot(goal[0] - start[0], goal[1] - start[1])
+            heading = math.atan2(goal[1] - start[1], goal[0] - start[0])
+            self.turn_by(wrap_angle(heading - odom_yaw(self.odom)),
+                         timeout=FINISH_TURN_TIMEOUT)
+            self.get_logger().info(
+                'Nav2 停在目标 %.2f m 外，直接低速补完最后一段 ...' % distance)
+            start = odom_xy(self.odom)
+            travelled = 0.0
+            deadline = time.monotonic() + FINISH_TIMEOUT
+            while rclpy.ok() and time.monotonic() < deadline:
+                if travelled >= distance - FINISH_TOLERANCE:
+                    break
+                self.cmd_pub.publish(make_forward_twist(FINISH_SPEED))
+                rclpy.spin_once(self, timeout_sec=0.05)
+                if self.odom is not None:
+                    travelled = odom_distance(start, odom_xy(self.odom))
+            self.stop_and_settle()
+            if travelled < distance - FINISH_TOLERANCE:
+                self.get_logger().warning(
+                    '只补了 %.2f m（目标 %.2f m），继续用视觉对准' %
+                    (travelled, distance))
+        if self.odom is not None:
+            remaining = wrap_angle(goal[2] - odom_yaw(self.odom))
+            if abs(remaining) > FINISH_YAW_TOLERANCE:
+                self.turn_by(remaining, timeout=FINISH_TURN_TIMEOUT)
+                self._publish_stop(0.3)
+        return True
+
     def aim_at_estimated_cube(self, cube_xy):
         """
         Point the wrist camera at the cube from the stopped base.
@@ -704,31 +862,56 @@ class SearchAndGraspNode(VisualGraspNode):
                 % MAP_TOPIC)
             return False
         free, reason = self.goal_is_free(goal_x, goal_y)
-        if not free:
-            # The search's top-face measurement is range-biased when the
-            # cube is seen obliquely: at y=-0.6 m the estimate came out
-            # 9 cm too far east, which put the 0.6 m standoff inside the
-            # table's clearance band. Back the goal off along the same
-            # cube->robot line (still facing the cube) and retry; the real
-            # cube is then only 0.05-0.10 m farther than the nominal
-            # standoff, inside the arm's reach. The map check runs again
-            # for every candidate, so a retreat into another obstacle is
-            # still refused.
-            for extra in NAV_GOAL_RETREAT_STEPS:
-                candidate_x, candidate_y, candidate_yaw = standoff_goal(
-                    cube_xy, robot_xy, self.standoff + extra)
-                candidate_free, _ = self.goal_is_free(
-                    candidate_x, candidate_y)
-                if candidate_free:
-                    self.get_logger().warning(
-                        '导航目标 (%0.2f, %0.2f) 不可用：%s；沿视线后退 '
-                        '%.2f m，改用 (%0.2f, %0.2f) ...'
-                        % (goal_x, goal_y, reason, extra,
-                           candidate_x, candidate_y))
-                    goal_x, goal_y = candidate_x, candidate_y
-                    yaw = candidate_yaw
-                    free = True
-                    break
+        if free:
+            # The nominal goal clears the bare minimum but may still fall in
+            # the local costmap's inscribed band, in which case the warning
+            # below reports this strict reason. Without it the log would say
+            # "不可用：" with nothing after it.
+            strict_free, strict_reason = self.goal_is_free(
+                goal_x, goal_y, NAV_GOAL_SAFE_CLEARANCE)
+            if not strict_free:
+                reason = strict_reason or (
+                    '离桌子/障碍物不足 %.2f m' % NAV_GOAL_SAFE_CLEARANCE)
+
+        def first_free(clearance):
+            """Nominal goal first, then the bearings/retreats at this margin."""
+            if self.goal_is_free(goal_x, goal_y, clearance)[0]:
+                return 0.0, 0.0, goal_x, goal_y, yaw
+            for offset, extra, candidate_x, candidate_y, candidate_yaw in \
+                    standoff_candidates(cube_xy, robot_xy, self.standoff):
+                if offset == 0.0 and extra == 0.0:
+                    continue
+                if self.goal_is_free(candidate_x, candidate_y, clearance)[0]:
+                    return offset, extra, candidate_x, candidate_y, \
+                        candidate_yaw
+            return None
+
+        # Two things push the nominal goal into the table's clearance band:
+        # the oblique top-face measurement (up to ~10 cm too far east) and a
+        # base left at a shallow angle beside the table. Try the neighbouring
+        # bearings and retreats, preferring goals whose cell the local
+        # costmap can actually reach (NAV_GOAL_SAFE_CLEARANCE) and only then
+        # the physically-safe bare minimum, because a goal in the inscribed
+        # band wedges DWB. Every candidate keeps the standoff radius (the
+        # arm's reach) and is re-checked against the map, so a candidate
+        # inside the table or a wall is still refused.
+        chosen = (first_free(NAV_GOAL_SAFE_CLEARANCE)
+                  or first_free(NAV_GOAL_CLEARANCE))
+        if chosen is not None:
+            offset, extra, candidate_x, candidate_y, candidate_yaw = chosen
+            if (offset, extra) != (0.0, 0.0):
+                change = []
+                if extra:
+                    change.append('沿视线后退 %.2f m' % extra)
+                if abs(offset) > 1e-6:
+                    change.append('绕方块转 %.0f°' % math.degrees(offset))
+                self.get_logger().warning(
+                    '导航目标 (%0.2f, %0.2f) 不可用：%s；%s，改用 '
+                    '(%0.2f, %0.2f) ...'
+                    % (goal_x, goal_y, reason, '并'.join(change) or '调整',
+                       candidate_x, candidate_y))
+                goal_x, goal_y, yaw = candidate_x, candidate_y, candidate_yaw
+        free = chosen is not None
         if not free:
             self.get_logger().error(
                 '导航目标 (%0.2f, %0.2f) 不可用：%s。已拒绝发送，'
@@ -740,12 +923,34 @@ class SearchAndGraspNode(VisualGraspNode):
         if status == 'near':
             # Nav2 stopped within a few centimetres of the goal but never
             # reported SUCCEEDED (usually a yaw the base cannot settle on).
-            # The base is stopped; re-aim the camera using the cube estimate
-            # and let the proven visual grasp run.
+            # Drive the remaining, bounded stretch so the arm gets the
+            # standoff geometry it was tuned for, then re-aim the camera
+            # using the cube estimate and let the proven visual grasp run.
+            self.finish_standoff(goal_x, goal_y, yaw)
             if not self.aim_at_estimated_cube(cube_xy):
                 return False
             return True
+        # SUCCEEDED does not mean the base is on the standoff. The stateful
+        # goal checker latches the first moment both tolerances are met, and
+        # this base has no brake: at y=+0.6 m it latched at the 5 cm edge of
+        # the xy tolerance and then drifted 5.7 cm backwards over the next
+        # 20 s, finishing 9 cm short and 0.81 m from the cube -- outside the
+        # arm's 0.70 m reach, so the grasp was refused after a "successful"
+        # navigation. Drive the bounded remainder from /odom, exactly as the
+        # 'near' path does.
+        self.finish_standoff(goal_x, goal_y, yaw)
         self.stop_and_settle()
+        # Nav2 may stop up to yaw_goal_tolerance (0.25 rad = 14 deg) off the
+        # bearing to the cube. That is harmless for the arm, which re-aligns
+        # the gripper to the measured base yaw, but not for the wrist camera:
+        # it looks almost straight down from about 14 cm above the cube top,
+        # so its 60 deg view covers only +/-8 cm and a 10 cm lateral offset
+        # puts the cube out of frame. The fixed look pose then fails all 10 s
+        # of the colour search (observed at y=+0.6 m). Re-aim at the cube
+        # using the ground-truth search-time point and the base's actual
+        # pose, exactly as the 'near' path does.
+        if not self.aim_at_estimated_cube(cube_xy):
+            return False
         return True
 
     # --------------------------------------------------------------- retry
