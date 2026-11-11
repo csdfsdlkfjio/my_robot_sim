@@ -3,6 +3,7 @@
 import os
 import xml.etree.ElementTree as ET
 
+import pytest
 import yaml
 
 PKG_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -101,13 +102,26 @@ def test_hand_uses_position_and_effort_controllers():
         'panda_finger_joint1', 'panda_finger_joint2'}
 
 
-def test_finger_controllers_tolerate_the_grasp_squeeze():
-    """The fingers stop against the cube a few mm short of the target."""
+def test_hand_position_goal_tolerance_is_tighter_than_the_pre_close_travel():
+    """
+    The JTC must not mistake the open stop for the pre-close target.
+
+    Live at y=+0.6 m the pads sat at 0.0392/0.0395 m and the target was
+    0.0295 m; with a 1 cm per-joint goal tolerance the controller reported
+    success immediately and never moved a finger, three resends included.
+    The squeeze runs on the effort controller, so the position JTC no longer
+    needs that tolerance. Keep it well below the smallest pre-close travel
+    (5 cm cube, no lateral offset: 0.040 - 0.029 = 11 mm).
+    """
     config = load_yaml(CONTROLLERS)
     constraints = config['panda_hand_controller']['ros__parameters'][
         'constraints']
+    pre_close_travel = 0.040 - (0.05 / 2.0 + 0.004)
+    assert pre_close_travel == pytest.approx(0.011)
     for joint in ('panda_finger_joint1', 'panda_finger_joint2'):
-        assert constraints[joint]['goal'] >= 0.005, joint
+        goal = constraints[joint]['goal']
+        assert 0.0 < goal <= 0.002, joint
+        assert goal <= pre_close_travel / 4.0, joint
 
 
 def test_srdf_robot_name_matches_the_merged_urdf():

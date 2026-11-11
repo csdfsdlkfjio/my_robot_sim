@@ -2,6 +2,7 @@
 
 import math
 import os
+import types
 
 import pytest
 from geometry_msgs.msg import Quaternion, Twist
@@ -12,6 +13,7 @@ from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Float64MultiArray
 
+from my_robot_sim import mobile_manipulation_node as manipulation_module
 from my_robot_sim.grasp_box import load_config
 from my_robot_sim.mobile_manipulation_node import (
     ARM_BASE_FRAME,
@@ -28,8 +30,10 @@ from my_robot_sim.mobile_manipulation_node import (
     GRIPPER_GOAL_TOLERANCE,
     GRIPPER_OPEN,
     GROUND_TRUTH_TOPIC,
+    HAND_EFFORT_CONTROLLER,
     HAND_GROUP,
     HAND_JOINTS,
+    HAND_POSITION_CONTROLLER,
     HOME_DURATION,
     HOME_JOINTS,
     MobileManipulationNode,
@@ -582,6 +586,126 @@ def test_wait_for_pad_motion_returns_immediately_when_the_pads_moved():
         sleep=lambda seconds: pytest.fail('must not sleep'))
     assert positions == pytest.approx((0.0360, 0.0360))
     assert calls['n'] == 1
+
+
+class FakeLogger:
+    """Swallow the node's log calls."""
+
+    def info(self, message):
+        pass
+
+    def warning(self, message):
+        pass
+
+    def error(self, message):
+        pass
+
+
+class FakeServiceFuture:
+    """Already-complete service future carrying a ListControllers response."""
+
+    def __init__(self, states):
+        self._response = types.SimpleNamespace(
+            controller=[
+                types.SimpleNamespace(name=name, state=state)
+                for name, state in states.items()])
+
+    def done(self):
+        return True
+
+    def result(self):
+        return self._response
+
+
+class FakeListClient:
+    """controller_manager list_controllers stand-in."""
+
+    def __init__(self, states):
+        self.states = states
+
+    def wait_for_service(self, timeout_sec):
+        return True
+
+    def call_async(self, request):
+        return FakeServiceFuture(self.states)
+
+
+def make_controller_node(monkeypatch, states):
+    """Node with just the state query and a recording controller switch."""
+    node = object.__new__(MobileManipulationNode)
+    node.list_client = FakeListClient(states)
+    node.get_logger = lambda: FakeLogger()
+    switches = []
+
+    def switch(activate, deactivate, timeout=15.0):
+        switches.append((list(activate), list(deactivate)))
+        return True
+
+    node.switch_controllers = switch
+    monkeypatch.setattr(
+        manipulation_module.rclpy, 'spin_until_future_complete',
+        lambda *args, **kwargs: None)
+    return node, switches
+
+
+def test_pre_close_leaves_an_active_position_controller_alone(monkeypatch):
+    """The normal launch state needs no switch."""
+    node, switches = make_controller_node(monkeypatch, {
+        HAND_POSITION_CONTROLLER: 'active',
+        HAND_EFFORT_CONTROLLER: 'inactive',
+    })
+
+    assert node.ensure_hand_position_controller()
+    assert switches == []
+
+
+def test_pre_close_takes_the_fingers_back_from_the_effort_controller(
+        monkeypatch):
+    """
+    A failed squeeze must not strand the pre-close on an inactive JTC.
+
+    ensure_gripper_open() returns early when the pads already read open, so
+    after a failed squeeze the effort controller can still own the finger
+    interfaces when the next attempt pre-closes.
+    """
+    node, switches = make_controller_node(monkeypatch, {
+        HAND_POSITION_CONTROLLER: 'inactive',
+        HAND_EFFORT_CONTROLLER: 'active',
+    })
+
+    assert node.ensure_hand_position_controller()
+    assert switches == [
+        ([HAND_POSITION_CONTROLLER], [HAND_EFFORT_CONTROLLER])]
+
+
+def test_pre_close_refuses_a_missing_position_controller(monkeypatch):
+    """Without panda_hand_controller there is no way to close the pads."""
+    node, switches = make_controller_node(monkeypatch, {
+        HAND_EFFORT_CONTROLLER: 'active',
+    })
+
+    assert not node.ensure_hand_position_controller()
+    assert switches == []
+
+
+def test_pre_close_switches_the_position_controller_on_first():
+    """The switch must happen before the trajectory, then squeeze re-swaps."""
+    path = os.path.join(
+        os.path.dirname(__file__), '..', 'my_robot_sim',
+        'mobile_manipulation_node.py')
+    with open(path, encoding='utf-8') as handle:
+        source = handle.read()
+    pre_close = source[
+        source.index('    def pre_close_gripper'):
+        source.index('    def press_until_seated')]
+    assert 'self.ensure_hand_position_controller()' in pre_close
+    assert pre_close.index('ensure_hand_position_controller') < \
+        pre_close.index('send_hand_trajectory')
+    squeeze = source[
+        source.index('    def squeeze_gripper'):
+        source.index('    def release_grip')]
+    assert 'activate=[HAND_EFFORT_CONTROLLER]' in squeeze
+    assert 'deactivate=[HAND_POSITION_CONTROLLER]' in squeeze
 
 
 def test_both_grasp_sequences_verify_the_pre_close_position():

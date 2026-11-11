@@ -55,7 +55,7 @@ import rclpy
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from control_msgs.action import FollowJointTrajectory
-from controller_manager_msgs.srv import SwitchController
+from controller_manager_msgs.srv import ListControllers, SwitchController
 from geometry_msgs.msg import Point, PointStamped, Pose, Quaternion, Twist
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
@@ -155,6 +155,7 @@ HAND_POSITION_CONTROLLER = 'panda_hand_controller'
 HAND_EFFORT_CONTROLLER = 'panda_hand_effort_controller'
 HAND_EFFORT_TOPIC = '/panda_hand_effort_controller/commands'
 SWITCH_CONTROLLER_SERVICE = '/controller_manager/switch_controller'
+LIST_CONTROLLERS_SERVICE = '/controller_manager/list_controllers'
 # Clearance between each pad and the cube for the base node's fixed pre-close,
 # and the largest lateral cube-to-hand offset the visual grasp will descend
 # with. If a pad does touch the cube's top edge on the way down, the contact
@@ -847,6 +848,8 @@ class MobileManipulationNode(Node):
             self, ExecuteTrajectory, EXECUTE_ACTION)
         self.switch_client = self.create_client(
             SwitchController, SWITCH_CONTROLLER_SERVICE)
+        self.list_client = self.create_client(
+            ListControllers, LIST_CONTROLLERS_SERVICE)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -1257,6 +1260,53 @@ class MobileManipulationNode(Node):
             return False
         return True
 
+    def controller_states(self, timeout=15.0):
+        """Return controller_manager's ``{name: state}``, or None."""
+        if not self.list_client.wait_for_service(timeout_sec=timeout):
+            self.get_logger().error(
+                '没有找到 %s' % LIST_CONTROLLERS_SERVICE)
+            return None
+        future = self.list_client.call_async(ListControllers.Request())
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+        if not future.done() or future.result() is None:
+            self.get_logger().error('查询夹爪控制器状态超时')
+            return None
+        return {controller.name: controller.state
+                for controller in future.result().controller}
+
+    def ensure_hand_position_controller(self, timeout=15.0):
+        """
+        Make the position JTC own the fingers before a pre-close.
+
+        A failed squeeze leaves the effort controller active, and
+        ensure_gripper_open() returns early when the pads already look open
+        without switching back. A trajectory sent to an inactive JTC can then
+        be accepted and reported successful while no finger moves -- the
+        "预闭合没有生效" failure. Query the real controller state instead of
+        assuming the launch-time owner is still active.
+        """
+        states = self.controller_states(timeout)
+        if states is None:
+            return False
+        if HAND_POSITION_CONTROLLER not in states:
+            self.get_logger().error(
+                '%s 没有加载，无法执行位置预闭合' % HAND_POSITION_CONTROLLER)
+            return False
+        position_active = states[HAND_POSITION_CONTROLLER] == 'active'
+        effort_active = states.get(HAND_EFFORT_CONTROLLER) == 'active'
+        if position_active and not effort_active:
+            return True
+        self.get_logger().info(
+            '预闭合前恢复位置控制：%s=%s，%s=%s，切换到 %s ...'
+            % (HAND_POSITION_CONTROLLER, states[HAND_POSITION_CONTROLLER],
+               HAND_EFFORT_CONTROLLER,
+               states.get(HAND_EFFORT_CONTROLLER, '未加载'),
+               HAND_POSITION_CONTROLLER))
+        return self.switch_controllers(
+            activate=[] if position_active else [HAND_POSITION_CONTROLLER],
+            deactivate=[HAND_EFFORT_CONTROLLER] if effort_active else [],
+            timeout=timeout)
+
     def ensure_gripper_open(self, stage):
         """
         Open both fingers to the mechanical stop and verify the gap.
@@ -1326,7 +1376,16 @@ class MobileManipulationNode(Node):
         (and impact speed) for the force squeeze that follows, so it is
         measured and logged, and a goal that never moved the pads off the
         open stop is sent once more.
+
+        The position JTC must own the finger interfaces first: if the effort
+        controller is still active, its goals cannot move the fingers and the
+        pre-close silently does nothing.
         """
+        if not self.ensure_hand_position_controller():
+            self.get_logger().error(
+                '预闭合前无法恢复 %s，放弃夹紧以免对着张开的夹爪空按。'
+                % HAND_POSITION_CONTROLLER)
+            return False
         positions = None
         for attempt in range(1, PRE_CLOSE_ATTEMPTS + 1):
             if not self.send_hand_trajectory(position):

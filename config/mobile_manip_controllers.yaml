@@ -62,14 +62,20 @@ panda_hand_controller:
     constraints:
       stopped_velocity_tolerance: 0.05
       goal_time: 1.0
-      # When the fingers squeeze the grasp cube they stop a few millimetres
-      # short of their commanded position. Without a per-joint goal tolerance
-      # the controller would report GOAL_TOLERANCE_VIOLATED and MoveIt would
-      # treat the grasp as a failed trajectory.
+      # This controller only opens the gripper and performs the pre-close;
+      # the squeeze itself runs on panda_hand_effort_controller, so it never
+      # needs to tolerate a cube blocking the fingers.
+      # Keep the goal tolerance well below the pre-close travel. With 1 cm
+      # (the old value) the open stop (0.0395 m) was within tolerance of the
+      # 0.0295 m pre-close target: the JTC declared success immediately and
+      # never moved a finger, and three resends failed the same way. The
+      # smallest pre-close travel (5 cm cube, no lateral offset) is
+      # 0.040 - 0.029 = 11 mm; 1.5 mm leaves the controller no room to call
+      # the open stop "already there".
       panda_finger_joint1:
-        goal: 0.01
+        goal: 0.0015
       panda_finger_joint2:
-        goal: 0.01
+        goal: 0.0015
 
 panda_hand_effort_controller:
   ros__parameters:
