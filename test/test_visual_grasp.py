@@ -9,6 +9,7 @@ from builtin_interfaces.msg import Time
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
 
+from my_robot_sim import visual_grasp as visual_module
 from my_robot_sim.visual_grasp import (
     Detection,
     MIN_VALID_DEPTH,
@@ -542,3 +543,79 @@ def test_grasp_measurements_require_frames_newer_than_the_arm_move():
     assert 'use_depth' in target
     assert target.count('self.checked_surface') == 3
     assert 'def checked_surface' in source
+
+
+class RecordingLogger:
+    """Capture warning messages from the refinement guard."""
+
+    def __init__(self):
+        self.warnings = []
+
+    def info(self, message):
+        pass
+
+    def warning(self, message):
+        self.warnings.append(message)
+
+    def error(self, message):
+        pass
+
+
+def make_refinement_node(logger):
+    """Build a node whose close-up pass returns a fixed arm-frame point."""
+    node = object.__new__(VisualGraspNode)
+    node.image_stamp = None
+    node.depth_stamp = None
+    node.depth = None
+    # The first measurement, in the world frame, matches the spawned cube.
+    node.surface_world = (1.4508, -0.6006, 0.3500)
+    node.wait_for_fresh_detection = lambda *args, **kwargs: Detection(
+        400.0, 240.0, 500.0)
+    node.publish_debug_image = lambda detection: None
+    node.closing_axis_in_arm_frame = lambda: None
+    node.target_point_in_arm_frame = lambda *args, **kwargs: (
+        (0.7418, -0.1049, 0.1150), 'top')
+    node.base_pose = lambda: object()
+    node.compensated_surface = lambda previous, stage: previous
+    node.get_logger = lambda: logger
+    return node
+
+
+def test_refine_accepts_a_millimetre_level_world_correction(monkeypatch):
+    """A close-up measurement a few millimetres from the first one is used."""
+    logger = RecordingLogger()
+    node = make_refinement_node(logger)
+    candidate = (1.4548, -0.6046, 0.3500)
+    monkeypatch.setattr(
+        visual_module, 'point_in_world', lambda point, pose: candidate)
+
+    result = node.refine_target((0.74, -0.06, 0.115))
+
+    assert result == (0.7418, -0.1049, 0.1150)
+    assert node.surface_world == candidate
+    assert logger.warnings == []
+
+
+def test_refine_rejects_a_five_centimetre_world_jump(monkeypatch):
+    """
+    A close-up pass that lands 5 cm off the cube is a misdetection.
+
+    Live at cube y=-0.6 m the first top-face measurement gave the world
+    point (1.4508, -0.6006), matching the spawned cube at (1.45, -0.60).
+    The close-up pass produced one 5.0 cm away; the old 5 cm threshold
+    accepted it, the hand re-aimed 5 cm to the side and the descent shoved
+    the unbraked base 22 cm. The cube never moves, so keep the first point.
+    """
+    logger = RecordingLogger()
+    node = make_refinement_node(logger)
+    monkeypatch.setattr(
+        visual_module, 'point_in_world',
+        lambda point, pose: (1.5008, -0.5506, 0.3500))
+    previous = (0.74, -0.06, 0.115)
+
+    result = node.refine_target(previous)
+
+    assert result == previous
+    assert node.surface_world == (1.4508, -0.6006, 0.3500)
+    assert len(logger.warnings) == 1
+    assert '跳变 5.0 cm' in logger.warnings[0]

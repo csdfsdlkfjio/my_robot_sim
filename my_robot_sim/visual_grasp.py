@@ -133,9 +133,13 @@ LOOK_POSITION = (0.58, 0.0, 0.42)
 # A closer re-detection is only trusted if the cube has not jumped in the
 # *world* frame. Comparing panda_link0 points would reject a valid refinement
 # whenever the unbraked chassis crept while the arm moved, which is exactly
-# the case the refinement has to correct. A world shift beyond this is more
-# likely an arm part than the cube.
-MAX_REFINEMENT_SHIFT = 0.05  # m, between the two vision measurements
+# the case the refinement has to correct. The cube itself never moves, so a
+# world shift beyond ~2 cm is a misdetection (an arm part or the table in
+# view), not a correction. Live at cube y=-0.6 m the old 5 cm limit accepted
+# a 5.0 cm jump: the hand re-aimed 5 cm to the side of the cube, the descent
+# pushed the unbraked base 22 cm and the pre-close check aborted. Keep this
+# below half the cube's 5 cm width.
+MAX_REFINEMENT_SHIFT = 0.02  # m, between the two vision measurements
 
 Detection = namedtuple('Detection', ['u', 'v', 'area'])
 
