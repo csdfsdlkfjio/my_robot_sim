@@ -242,6 +242,9 @@ ros2 launch my_robot_sim nav2.launch.py params_file:=/绝对路径/nav2_params.y
 `my_robot_sim/search_and_grasp.py` 是移动操作的总控状态机，直接复用已经验证过的 `visual_grasp` 流程：
 
 1. **搜索**：腕部相机移到前视位姿，底盘原地每步转 30°，共 12 步（360°）；每一步做红色分割 + 顶面反投影，得到方块在 `panda_link0` 下的点，再用 TF 换到 `map`。
+   这里有两个和"转了 360° 也没看到红色方块"直接相关的细节：
+   - **只信新帧**：WSL2 下 `/camera/image_raw` 实测只有 0.3–0.6 Hz（帧间隔最长 4.9 s），底盘转完时 `color_image` 里常常还是转之前、甚至机械臂还在运动时的旧帧。搜索会记下每步旋转前的图像时间戳，只用**晚于它**的帧检测（`wait_for_fresh_detection`：每步最多等 5 s，至少检查两帧新图）。开始搜索前还会先等 `/camera/image_raw` 出图，没有就立即报错并提示检查相机插件，而不是空转一圈。
+   - **俯角避开夹爪**：相机装在夹爪正后方 6 cm，深度图在画面中心读到的就是夹爪自己（0.06 m，而房间在 1 m 以外），所以夹爪会占据画面中央。前视位姿的俯角因此加到 34°（`SEARCH_CAMERA_TILT`），让 1–3 m 处的桌面和方块投影到夹爪上方。实测从起点重启后**第 1 步**就能看到方块（像素 (364, 110)），不需要转动。
 2. **导航**：调用 Nav2 的 `NavigateToPose`，走到离方块 `standoff`（默认 0.63 m）的位置，并转身面对方块。这个半径被两个约束挤出来：抓取在 `panda_link0` 下超过 `GRASP_REACH_MAX = 0.70 m` 就拒绝，而 `panda_link0` 在 `base_link` 后面约 4 cm，所以车体中心离方块最多约 0.66 m；本地代价地图按 0.22 m 车体半径膨胀长桌，整条 x ≥ 0.875 的带子都是内切障碍（代价 99），目标格子落在那里时 DWB 会报 "No valid trajectories" 并卡死，因此目标要留在 x ≤ 0.85。0.63 m 同时满足两边：目标 x ≈ 0.84，`panda_link0` 距离约 0.67 m。
    发送目标前用 `map_server` 的栅格做两级检查：以目标点为圆心、先按 `NAV_GOAL_SAFE_CLEARANCE = 0.30 m`（比内切带多留一格）检查，全部候选都不行再退回 `NAV_GOAL_CLEARANCE = 0.24 m`（车体外接半径 + 2 cm 余量）。距离按点到栅格矩形的**精确**距离算，不按格子取整，避免斜向目标被误拒。候选顺序是：标称目标 → 同一半径上 ±15°、±30°、±45° 的方位（`NAV_GOAL_BEARING_OFFSETS`）→ 最后才沿视线后退 2 cm（`NAV_GOAL_RETREAT_STEPS`）。方位候选优先是因为后退会把方块推到臂展边缘：实测 0.70 m 的 standoff 在 `panda_link0` 下读到 0.74 m，抓取被拒。只有全部候选都不行才拒绝发送并报错，避免视觉定位异常时把目标点算到墙里或地图外。
    末端不再死等：剩余距离连续 20 s 都在 0.20 m 内却拿不到 `SUCCEEDED`（日志里常见的 0.00–0.16 m 反复横跳），就取消目标并进入"补完最后一段"。Nav2 报 `SUCCEEDED` 也不代表车停在观察位上：goal checker 在 xy 容差边缘（5 cm）就会锁定并返回成功，而无刹车的底盘随后还会继续漂移（实测沿 -x 漂了 5.7 cm，最后离方块 0.81 m，超出抓取范围）。所以 `finish_standoff()` 对两种结果都会执行：用 `/odom`（本仿真里等于 Gazebo 真值）低速补完最后不超过 25 cm 的直线段和朝向误差，再按搜索时估计的方块位置重新对准腕部相机——相机视野只有约 ±8 cm，14° 的底盘朝向误差就足以让方块出画。真正到不了的目标仍受 180 s 硬超时保护。
@@ -274,9 +277,9 @@ ros2 run my_robot_sim search_and_grasp --ros-args \
 **成功时终端里的关键输出**（数字来自实测）：
 
 ```
-搜索：第 11 步看到红色区域，像素 (552, 256)，面积 861 px²，开始反投影...
-搜索成功：方块在 panda_link0 下为 (1.4331, -0.4026, 0.1160)（来源：顶面点云），地图坐标为 (1.4980, 0.0511)。
-导航：方块在 (1.50, 0.05)，机器人在 (0.06, -0.01)，目标停在离方块 0.63 m 的 (0.87, 0.03)，朝向 2° ...
+搜索：第 1 步看到红色区域，像素 (364, 110)，面积 751 px²，开始反投影...
+搜索成功：方块在 panda_link0 下为 (1.5061, -0.0026, 0.1160)（来源：顶面点云），地图坐标为 (1.4537, -0.0027)。
+导航：方块在 (1.45, -0.00)，机器人在 (-0.01, 0.00)，目标停在离方块 0.63 m 的 (0.82, -0.00)，朝向 -0° ...
 方块上表面的世界坐标为 (1.4499, -0.0012, 0.3525)；...
 下探后夹爪中心与方块中心的水平偏差为 1.2 mm（沿手指方向 0.9 mm，允许 12.0 mm）。
 预闭合后两指停在 (0.0321, 0.0300) m，与目标 0.0299 m 相差 2.2 mm；这段距离会由随后的夹紧补上。
@@ -286,6 +289,57 @@ Gazebo 已把 grasp_box 固定到 panda_hand 上
 ```
 
 方块默认真实位置是 `(1.45, 0, 0.325)`（桌面上表面 z = 0.30 + 方块半高 0.025，见 `config/grasp_box.yaml`）。搜索阶段的地图坐标允许几厘米误差（AMCL 估计），最终抓取用的是腕部相机测得的世界坐标，所以抓取精度不受搜索误差影响。
+
+#### 搜索看不到红色方块时的排查顺序
+
+以下命令都在 `source ~/ros2_ws/install/setup.bash` 之后执行。如果日志里出现 `搜索：第 N 步没等到新图像`，说明相机话题已经停发，先按第 1、2 条查。
+
+1. **图像话题到底有没有在发**
+   ```bash
+   ros2 topic info -v /camera/image_raw      # publisher 应为 arm_camera_controller，RELIABLE
+   ros2 topic hz /camera/image_raw           # WSL2 下正常也只有 0.3-0.6 Hz
+   ros2 topic echo --once /camera/image_raw --field header     # stamp 应在走
+   ros2 topic echo --once /camera/image_raw --field encoding   # 应为 rgb8
+   ```
+   `ros2 topic hz` 对这么低的帧率要等十几秒才打印第一行，没立刻出数不等于没有图像。
+
+2. **相机插件是不是加载失败了、Gazebo 是不是还活着**
+   ```bash
+   ros2 node list | grep camera      # /arm_camera_controller
+   gz topic -l | grep camera         # /gazebo/default/mobile_manipulator/panda_link7/arm_camera/image
+   ls -t ~/.ros/log | head -3        # 最近几次 launch 的日志目录
+   dmesg | tail -40                  # WSL2 下 Gazebo 崩溃会留下 gzserver ... signal 6 / CaptureCrash
+   ```
+   没有 `arm_camera_controller` 节点就去看 launch 终端或 `~/.ros/log/latest/`：`spawn_entity` 失败、`gzserver` 提前退出都会让相机话题消失。本机诊断时遇到过 WSL2 图形栈把 `gzserver` 弄成 SIGABRT，表现就是仿真卡死、话题全部消失。
+
+3. **图像里有没有红色像素**：插件发的是 `rgb8`，直接当 BGR 读会把红蓝对调（实测会把蓝色 `box_1` 统计成"红色"）。用 RViz（`ros2 run rviz2 rviz2`，加一个 Image display 选 `/camera/image_raw`）最直观；要用命令行，跑下面这段（Ctrl-C 结束）：
+   ```bash
+   python3 - <<'EOF'
+   import cv2, numpy as np, rclpy
+   from rclpy.node import Node
+   from rclpy.qos import qos_profile_sensor_data
+   from sensor_msgs.msg import Image
+   class Check(Node):
+       def __init__(self):
+           super().__init__('red_check')
+           self.create_subscription(Image, '/camera/image_raw', self.cb,
+                                    qos_profile_sensor_data)
+       def cb(self, msg):
+           img = np.frombuffer(msg.data, np.uint8).reshape(
+               msg.height, msg.step)[:, :msg.width * 3].reshape(
+                   msg.height, msg.width, 3)
+           if msg.encoding == 'rgb8':
+               img = img[:, :, ::-1]
+           hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+           mask = cv2.inRange(hsv, (0, 100, 60), (10, 255, 255)) | \
+               cv2.inRange(hsv, (170, 100, 60), (180, 255, 255))
+           print('red_pixels=%d' % int(mask.sum() / 255), flush=True)
+   rclpy.init()
+   rclpy.spin(Check())
+   EOF
+   ```
+
+4. **是不是被夹爪挡住或超出视野**：画面中心读到的深度只有 0.06 m 时，那是相机正后方的夹爪自己（房间在 1 m 以外）。如果方块就正对车头、画面中央却没有红色，先怀疑夹爪遮挡——正常搜索位姿的俯角已经为此调到 34°，方块在画面里应出现在夹爪上方。方块放在桌上 `y ∈ [-1, 1]` 都在搜索覆盖范围内；放在桌外或离车不足约 0.8 m 时搜索位姿可能看不到（那种距离直接跑视觉抓取即可）。
 
 ### 手动测试长桌左 / 中 / 右抓取
 
