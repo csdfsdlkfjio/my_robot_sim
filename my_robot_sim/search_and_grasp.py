@@ -908,7 +908,7 @@ class SearchAndGraspNode(VisualGraspNode):
                 self.get_logger().warning(
                     '导航目标 (%0.2f, %0.2f) 不可用：%s；%s，改用 '
                     '(%0.2f, %0.2f) ...'
-                    % (goal_x, goal_y, reason, '并'.join(change) or '调整',
+                    % (goal_x, goal_y, reason, '，'.join(change) or '调整',
                        candidate_x, candidate_y))
                 goal_x, goal_y, yaw = candidate_x, candidate_y, candidate_yaw
         free = chosen is not None
