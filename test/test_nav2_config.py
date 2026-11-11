@@ -84,6 +84,22 @@ def test_goal_checker_keeps_xy_tight_but_relaxes_yaw():
         checker['xy_goal_tolerance'])
 
 
+def test_progress_checker_allows_the_final_turn_in_place():
+    """
+    The Nav2 default (0.5 m in 10 s) aborts the last rotation at the standoff.
+
+    The standoff goals are about 1 m from the spawn point, and the final
+    approach is often an in-place turn next to the inflated long table; the
+    base_link position does not move at all while it turns, so the default
+    check declared "Failed to make progress" and the goal aborted (seen at
+    y=+0.6 m). 0.1 m in 15 s still catches a base wedged against the table.
+    """
+    server = load_params()['controller_server']['ros__parameters']
+    checker = server['progress_checker']
+    assert checker['required_movement_radius'] <= 0.15
+    assert checker['movement_time_allowance'] >= 12.0
+
+
 def test_launch_passes_params_file():
     """nav2.launch.py 必须把自定义参数文件传进去."""
     with open(LAUNCH, encoding='utf-8') as handle:
